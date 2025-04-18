@@ -1,0 +1,29 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Cargo launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=debug"
+                ]
+            },
+            "args": []
+        },
+    {
+        "type": "lldb",
+        "request": "launch",
+        "name": "Cargo launch",
+        "cargo": {
+            "args": [
+                "run",
+                "--bin=debug"
+            ]
+        },
+        "args": [],
+        "cwd": "${workspaceFolder}"
+    }
+    ]
+}

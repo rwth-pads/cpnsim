@@ -1,0 +1,10 @@
+# .cargo/config.toml
+
+[build]
+# Flags passed to all rustc invocations
+
+# You can also target specific platforms if needed:
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "--cfg", 'getrandom_backend="wasm_js"',
+]

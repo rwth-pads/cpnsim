@@ -4,7 +4,7 @@ version = "0.1.1"
 authors = ["István Koren"]
 edition = "2021"
 license = "MIT"
-description = "CPNsim is a Rust library and command-line tool for simulating Colored Petri Nets (CPNs)"
+description = "CPNsim is a Rust library  and command-line tool with WebAssembly target for simulating Colored Petri Nets (CPNs)"
 repository = "https://github.com/rwth-pads/cpnsim"
 
 [lib]

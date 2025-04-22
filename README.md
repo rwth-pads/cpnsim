@@ -27,4 +27,4 @@ cargo run
 cargo run -- examples/petrinet-2.ocpn
 
 # Build for release (WebAssembly)
-wasm-pack build --target web --features wasm
+wasm-pack build --scope rwth-pads --target web --features wasm

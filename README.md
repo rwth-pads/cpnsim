@@ -23,6 +23,8 @@ You can build the project using standard Cargo commands:
 ```bash
 # Build for development (debug mode)
 cargo run
+# Open a specific file in debug mode
+cargo run -- examples/petrinet-2.ocpn
 
 # Build for release (WebAssembly)
 wasm-pack build --target web --features wasm

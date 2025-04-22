@@ -1,0 +1,174 @@
+{
+  "petriNets": [
+    {
+      "id": "ID6",
+      "name": "Petri Net",
+      "places": [
+        {
+          "id": "a",
+          "name": "start",
+          "colorSet": "INT",
+          "initialMarking": "[1, 5, 5, 10]",
+          "marking": "",
+          "position": {
+            "x": -200,
+            "y": 0
+          },
+          "size": {
+            "width": 30,
+            "height": 30
+          }
+        },
+        {
+          "id": "c",
+          "name": "end place",
+          "colorSet": "INT",
+          "initialMarking": "",
+          "marking": "",
+          "position": {
+            "x": 0,
+            "y": 200
+          },
+          "size": {
+            "width": 50,
+            "height": 30
+          }
+        },
+        {
+          "id": "node_1745334260933",
+          "name": "place",
+          "colorSet": "INT",
+          "initialMarking": "[4,3,2]",
+          "marking": "",
+          "position": {
+            "x": -200.125,
+            "y": 172.625
+          },
+          "size": {
+            "width": 30,
+            "height": 30
+          }
+        }
+      ],
+      "transitions": [
+        {
+          "id": "b",
+          "name": "transition",
+          "guard": "",
+          "time": "",
+          "priority": "",
+          "position": {
+            "x": -100,
+            "y": 100
+          },
+          "size": {
+            "width": 50,
+            "height": 30
+          }
+        }
+      ],
+      "arcs": [
+        {
+          "id": "a->b",
+          "source": "a",
+          "target": "b",
+          "inscription": "var2"
+        },
+        {
+          "id": "b->c",
+          "source": "b",
+          "target": "c",
+          "inscription": "var2"
+        },
+        {
+          "id": "26d589fd-3919-4d05-84f2-f2978cff69e1",
+          "source": "node_1745334260933",
+          "target": "b",
+          "inscription": "var1"
+        }
+      ]
+    }
+  ],
+  "colorSets": [
+    {
+      "id": "9f751cc9-4a54-456b-9704-ff9bc92fcb0d",
+      "name": "UNIT",
+      "type": "basic",
+      "definition": "colset UNIT = unit;",
+      "color": "#3b82f6"
+    },
+    {
+      "id": "7385d290-1bb8-42c8-8e0b-3b4a99c1abc4",
+      "name": "BOOL",
+      "type": "basic",
+      "definition": "colset BOOL = bool;",
+      "color": "#10b981"
+    },
+    {
+      "id": "1b16a97f-72ab-4f6f-b10d-ec4a873532f4",
+      "name": "INT",
+      "type": "basic",
+      "definition": "colset INT = int;",
+      "color": "#3b82f6"
+    },
+    {
+      "id": "43fb7d9d-0411-4306-82ae-7848150a1619",
+      "name": "INTINF",
+      "type": "basic",
+      "definition": "colset INTINF = intinf;",
+      "color": "#3b82f6"
+    },
+    {
+      "id": "800b6a70-8454-496c-ac14-79f7392ae22f",
+      "name": "TIME",
+      "type": "basic",
+      "definition": "colset TIME = time;",
+      "color": "#8b5cf6"
+    },
+    {
+      "id": "d61b267a-ace9-4d5d-9bbc-707e51b78996",
+      "name": "REAL",
+      "type": "basic",
+      "definition": "colset REAL = real;",
+      "color": "#ef4444"
+    },
+    {
+      "id": "add806ca-cb89-49e5-b56f-01c4bb6eb8e8",
+      "name": "STRING",
+      "type": "basic",
+      "definition": "colset STRING = string;",
+      "color": "#f59e0b"
+    }
+  ],
+  "variables": [
+    {
+      "id": "24b15b77-9e58-40f0-93be-ed37093ddf15",
+      "name": "var1",
+      "colorSet": "INT"
+    },
+    {
+      "name": "var2",
+      "colorSet": "INT",
+      "id": "25a09dda-d613-4515-9e7e-0359f42a6cca"
+    }
+  ],
+  "priorities": [
+    {
+      "id": "e3b0bb7f-c60f-43e1-b1a8-661d0b256551",
+      "name": "P_HIGH",
+      "level": 100
+    },
+    {
+      "id": "2fec49b8-d06e-402f-bc0e-3dee7089cd12",
+      "name": "P_NORMAL",
+      "level": 1000
+    },
+    {
+      "id": "923b817a-c746-42da-af76-19b77aae0ec2",
+      "name": "P_LOW",
+      "level": 10000
+    }
+  ],
+  "functions": [],
+  "uses": []
+}

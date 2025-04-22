@@ -333,11 +333,11 @@ impl Simulator {
     // --- find_enabled_bindings (Revised) ---
     // Finds transitions that can fire and the specific bindings (variable assignments
     // and consumed tokens) that enable them.
-    // NOTE: This implementation is simplified and handles only single input arcs
-    // with simple variable inscriptions correctly. It needs significant extension
-    // for multi-arc bindings, tuple inscriptions, etc.
+    // NOTE: This implementation handles multiple input arcs with simple variable inscriptions.
+    // It needs extension for complex inscriptions (tuples, expressions), proper token comparison,
+    // and potentially performance optimizations.
     fn find_enabled_bindings(&mut self) -> Vec<(String, Binding)> {
-        let mut enabled_bindings = Vec::new();
+        let mut all_enabled_bindings = Vec::new();
         if let Some(net) = self.model.petri_nets.first() { // Assuming single net
             for transition in &net.transitions {
                 let mut potential_bindings: Vec<Binding> = vec![Binding::new()]; // Start with one empty binding
@@ -345,58 +345,126 @@ impl Simulator {
                 // --- Step 1: Generate potential bindings based on input arcs ---
                 let input_arcs: Vec<_> = net.arcs.iter().filter(|a| a.target == transition.id).collect();
 
-                if input_arcs.is_empty() {
-                    // No input arcs, binding is just the empty binding if guard passes
-                    // (Handled in Step 2)
-                } else {
-                    // --- Simplified Binding Logic (Handles single variable input arc) ---
-                    // TODO: Replace this with proper multi-arc binding resolution logic.
-                    if input_arcs.len() == 1 {
-                        let arc = input_arcs[0];
-                        let place_id = &arc.source;
-                        let inscription = &arc.inscription;
+                for arc in input_arcs {
+                    let place_id = &arc.source;
+                    let inscription = &arc.inscription;
+                    let mut next_bindings = Vec::new(); // Bindings satisfying arcs up to this one
 
-                        // Check if inscription is a simple declared variable
+                    // Check if the source place exists in the current marking
+                    let all_tokens_in_place = match self.current_marking.get(place_id) {
+                        Some(tokens) => tokens,
+                        None => {
+                            println!("Warning: Place {} for input arc {} not found in marking.", place_id, arc.id);
+                            potential_bindings = vec![]; // Cannot satisfy arc if place doesn't exist
+                            break; // Stop processing arcs for this transition
+                        }
+                    };
+
+                    for current_binding in &potential_bindings {
+                        // Determine tokens already consumed from this place *by this specific binding*
+                        // We need to know which *specific instances* are consumed if duplicates exist.
+                        // Using counts for now, assuming simple comparable types.
+                        // WARNING: This comparison logic (using to_string) is a placeholder
+                        // and will fail for complex, non-comparable token types.
+                        let consumed_counts = current_binding.consumed_tokens_map.get(place_id)
+                            .map(|tokens| {
+                                let mut counts = HashMap::new();
+                                for token in tokens {
+                                    *counts.entry(token.to_string()).or_insert(0) += 1;
+                                }
+                                counts
+                            })
+                            .unwrap_or_default();
+
+                        // Filter available tokens based on what's already consumed by this binding path
+                        let mut available_token_indices = Vec::new();
+                        let mut current_counts = HashMap::new();
+                        for (index, token) in all_tokens_in_place.iter().enumerate() {
+                            let token_str = token.to_string();
+                            let consumed_count = consumed_counts.get(&token_str).copied().unwrap_or(0);
+                            let current_count = current_counts.entry(token_str).or_insert(0);
+                            if *current_count < consumed_count {
+                                // This specific instance is already marked as consumed by this binding
+                                *current_count += 1;
+                            } else {
+                                // This instance is available for this binding
+                                available_token_indices.push(index);
+                            }
+                        }
+
+                        // --- Handle inscription type ---
                         if !inscription.is_empty() && self.declared_variables.contains_key(inscription) {
+                            // --- Case 1: Simple Variable Inscription ---
                             let var_name = inscription;
-                            if let Some(tokens) = self.current_marking.get(place_id) {
-                                if tokens.is_empty() {
-                                    potential_bindings = vec![]; // Cannot bind if place is empty
-                                } else {
-                                    let mut new_bindings = Vec::new();
-                                    for token in tokens {
-                                        let mut binding = Binding::new();
-                                        binding.variables.insert(var_name.clone(), token.clone());
-                                        binding.consumed_tokens_map.insert(place_id.clone(), vec![token.clone()]);
-                                        new_bindings.push(binding);
+
+                            if let Some(bound_value) = current_binding.variables.get(var_name) {
+                                // Variable already bound: Check if a matching *available* token exists
+                                let bound_value_str = bound_value.to_string(); // Simplistic comparison
+                                let mut found_match = false;
+                                for &index in &available_token_indices {
+                                    let token = &all_tokens_in_place[index];
+                                    if token.to_string() == bound_value_str {
+                                        let mut new_binding = current_binding.clone();
+                                        new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
+                                        next_bindings.push(new_binding);
+                                        found_match = true;
+                                        break; // Consume only one matching token per arc
                                     }
-                                    potential_bindings = new_bindings;
+                                }
+                                if !found_match {
+                                     // Discard binding path: Required token (matching bound value) not available
                                 }
                             } else {
-                                potential_bindings = vec![]; // Place not found or empty
+                                // Variable not bound yet: Create new bindings for each *available* token
+                                if available_token_indices.is_empty() {
+                                    // Discard binding path: Place has no available tokens to bind
+                                } else {
+                                    for &index in &available_token_indices {
+                                         let token = &all_tokens_in_place[index];
+                                         let mut new_binding = current_binding.clone();
+                                         new_binding.variables.insert(var_name.clone(), token.clone());
+                                         new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
+                                         next_bindings.push(new_binding);
+                                    }
+                                }
                             }
-                        } else if !inscription.is_empty() {
-                            // Inscription is not a simple variable or not declared.
-                            // Requires evaluating the expression to see what's needed.
-                            // This part is complex and not fully implemented here.
-                            // For now, assume it fails if it's not a simple variable.
-                            println!("Warning: Input arc {} for transition {} has complex inscription '{}' - binding not implemented.", arc.id, transition.name, inscription);
-                            potential_bindings = vec![];
+                        } else if inscription.is_empty() {
+                            // --- Case 2: Empty Inscription ---
+                            // CPN Semantics: Usually requires *a* token but doesn't bind/consume.
+                            // For simulation, we often treat it as needing the place to be non-empty.
+                            // Let's assume it requires at least one *available* token.
+                            if !available_token_indices.is_empty() {
+                                // Keep the current binding as is, constraint met.
+                                next_bindings.push(current_binding.clone());
+                            } else {
+                                // Discard binding path: Place empty, cannot satisfy empty inscription arc.
+                            }
+                        } else {
+                            // --- Case 3: Complex Inscription (Tuple, Expression, etc.) ---
+                            // This requires evaluating the inscription within the binding's context.
+                            // Not implemented here due to complexity.
+                            println!("Warning: Input arc {} for transition {} has complex inscription '{}' - binding not supported.", arc.id, transition.name, inscription);
+                            // Discard this binding path for now. In a full implementation,
+                            // you'd evaluate the expression and check if the required tokens exist.
                         }
-                        // If inscription is empty, the empty binding remains valid.
-                    } else {
-                        // TODO: Handle multiple input arcs - requires combining bindings (Cartesian product)
-                        // and checking for token conflicts if multiple arcs read from the same place.
-                        println!("Warning: Transition {} has multiple input arcs - complex binding not implemented.", transition.name);
-                        potential_bindings = vec![]; // Fail for now
+
+                    } // end loop over current_bindings
+
+                    potential_bindings = next_bindings; // Update bindings for the next arc iteration
+                    if potential_bindings.is_empty() {
+                        // If any arc cannot be satisfied, no bindings are possible for this transition
+                        break;
                     }
-                    // --- End Simplified Binding Logic ---
-                }
+                } // end loop over input_arcs
+
 
                 // --- Step 2: Check Guards for each potential binding ---
+                let mut enabled_bindings_for_transition = Vec::new();
                 for binding in potential_bindings {
+                    // Create a scope specific to this binding
                     let mut binding_scope = self.rhai_scope.clone();
                     for (var, val) in &binding.variables {
+                        // Use push_constant for immutability within the guard check
                         binding_scope.push_constant(var, val.clone());
                     }
 
@@ -405,7 +473,8 @@ impl Simulator {
                             match self.rhai_engine.eval_ast_with_scope::<bool>(&mut binding_scope, guard_ast) {
                                 Ok(result) => {
                                     if !result {
-                                        println!("  Guard failed for transition {} with binding {:?}", transition.name, binding.variables);
+                                        // Optional: Log guard failures for debugging
+                                        // println!("  Guard failed for transition {} with binding {:?}", transition.name, binding.variables);
                                     }
                                     result
                                 }
@@ -415,17 +484,24 @@ impl Simulator {
                                 }
                             }
                         }
-                        None => true, // No guard means it passes
+                        None => true, // No guard (or guard is "true") means it passes
                     };
 
                     if guard_passes {
-                        println!("  Transition {} enabled with binding {:?}", transition.name, binding.variables);
-                        enabled_bindings.push((transition.id.clone(), binding));
+                        // This binding satisfies all input arcs and the guard
+                        enabled_bindings_for_transition.push(binding);
                     }
                 }
-            }
+
+                // Add the fully validated bindings for this transition to the overall list
+                for enabled_binding in enabled_bindings_for_transition {
+                     println!("  Transition {} enabled with binding {:?}", transition.name, enabled_binding.variables);
+                     all_enabled_bindings.push((transition.id.clone(), enabled_binding));
+                }
+
+            } // end loop over transitions
         }
-        enabled_bindings
+        all_enabled_bindings
     }
 
     // Selects a transition and binding based on priority (and potentially randomness)

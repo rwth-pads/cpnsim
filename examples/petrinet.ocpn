@@ -9,7 +9,7 @@
           "name": "start",
           "colorSet": "INT",
           "initialMarking": "[10,10,5,10,10,10,10]",
-          "marking": "",
+          "marking": [10,10,5,10,10,10,10],
           "position": {
             "x": -200,
             "y": 0
@@ -24,7 +24,7 @@
           "name": "end place",
           "colorSet": "INT",
           "initialMarking": "",
-          "marking": "",
+          "marking": [],
           "position": {
             "x": 0,
             "y": 200

@@ -24,7 +24,7 @@
           "name": "end place",
           "colorSet": "INT",
           "initialMarking": "",
-          "marking": "",
+          "marking": [],
           "position": {
             "x": 0,
             "y": 200
@@ -39,7 +39,7 @@
           "name": "place",
           "colorSet": "INT",
           "initialMarking": "[4,3,2]",
-          "marking": "",
+          "marking": [],
           "position": {
             "x": -200.125,
             "y": 172.625

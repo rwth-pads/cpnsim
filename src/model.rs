@@ -1,4 +1,3 @@
-use serde_json::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use rhai::Dynamic; // Add missing import
@@ -39,7 +38,7 @@ pub struct Place {
     pub color_set: String, // Name of the color set
     pub initial_marking: String, // Rhai expression string or empty
     #[serde(default)] // Handle cases where marking might be absent or null initially
-    pub marking: Value, // Placeholder type for marking
+    pub marking: String, // Placeholder type for marking
     pub position: Position,
     pub size: Size,
 }

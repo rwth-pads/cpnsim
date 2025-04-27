@@ -1,6 +1,6 @@
 use crate::model::{PetriNetData, FiringEventData};
 // Remove unused ParseError import
-use rhai::{Engine, Scope, Dynamic, AST};
+use rhai::{Engine, Scope, Dynamic, AST, Module}; // Remove Position import if no longer needed
 use std::collections::{HashMap, HashSet};
 // Import the rand prelude for Rng and SliceRandom traits
 use rand::prelude::*;
@@ -34,7 +34,6 @@ pub struct Simulator {
     guards: HashMap<String, AST>,
     arc_expressions: HashMap<String, AST>,
     initial_marking_expressions: HashMap<String, AST>,
-    functions: HashMap<String, AST>, // Keep functions placeholder for now
     // Store declared variable names and their types (ColorSet names)
     declared_variables: HashMap<String, String>,
 }
@@ -42,14 +41,13 @@ pub struct Simulator {
 impl Simulator {
     // Change return type to use String for error
     pub fn new(model_data: PetriNetData) -> Result<Self, String> {
-        let engine = Engine::new(); // Removed mut
+        let mut engine = Engine::new(); // Make engine mutable for registration
         let mut scope = Scope::new(); // Make scope mutable for evaluation
 
         // Uncomment maps
         let mut guards = HashMap::new();
         let mut arc_expressions = HashMap::new();
         let mut initial_marking_expressions = HashMap::new();
-        let functions = HashMap::new(); // Placeholder
 
         let mut current_marking: HashMap<String, Vec<Dynamic>> = HashMap::new();
         let mut declared_variables: HashMap<String, String> = HashMap::new();
@@ -66,6 +64,47 @@ impl Simulator {
             declared_variables.insert(var.name.clone(), var.color_set.clone());
         }
         println!("Declared variables: {:?}", declared_variables);
+
+        // --- Compile and Register Functions ---
+        // Module will be created from AST evaluation below if functions exist
+        let mut all_fn_code = String::new();
+        for func in &model_data.functions {
+            // Append the code of each function definition.
+            // Ensure there's separation, e.g., a newline, although Rhai often handles this.
+            all_fn_code.push_str(&func.code);
+            all_fn_code.push('\n');
+        }
+
+        if !all_fn_code.is_empty() {
+            println!("Compiling all functions together...");
+            match engine.compile(&all_fn_code) {
+                Ok(ast) => {
+                    // Evaluate the AST containing all functions to define them within a *new* module.
+                    // This replaces the non-existent set_script_ast.
+                    // Use Module::eval_ast_as_new which takes the scope, ast, and engine.
+                    let fn_scope = Scope::new(); // Create a temporary scope for function definition evaluation
+                    // Pass scope by value/immutable borrow as expected by eval_ast_as_new
+                    match Module::eval_ast_as_new(fn_scope, &ast, &engine) {
+                        Ok(compiled_module) => {
+                            // Register the newly created module containing the functions globally
+                            engine.register_global_module(compiled_module.into());
+                        }
+                        Err(e) => {
+                            let err_msg = format!("Error evaluating function AST into new module: {}", e);
+                            println!("{}", err_msg);
+                            return Err(err_msg);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("Error compiling combined functions: {}", e);
+                    println!("{}", err_msg);
+                    return Err(err_msg);
+                }
+            }
+        }
+
+        // Module is registered above if functions were compiled and evaluated successfully
 
         // --- Compile Expressions ---
         for net in &model_data.petri_nets {
@@ -165,7 +204,6 @@ impl Simulator {
             guards,
             arc_expressions,
             initial_marking_expressions,
-            functions,
             declared_variables,
         })
     }

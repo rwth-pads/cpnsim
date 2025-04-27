@@ -63,7 +63,7 @@
           "id": "b->c",
           "source": "b",
           "target": "c",
-          "inscription": "var1"
+          "inscription": "addFive(var1)"
         }
       ]
     }

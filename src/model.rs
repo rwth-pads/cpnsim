@@ -107,16 +107,7 @@ pub struct Priority {
 pub struct FunctionDefinition {
     pub id: String, // Consider using Uuid
     pub name: String,
-    pub patterns: Vec<FunctionPattern>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // Allow unused fields
-pub struct FunctionPattern {
-    pub id: String, // Consider using Uuid
-    pub pattern: String, // Rhai pattern string, e.g., "(x,y)"
-    pub expression: String, // Rhai expression string
+    pub code: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -147,13 +147,7 @@
     {
       "id": "8196209c-c978-4447-9800-01944306a07b",
       "name": "gen",
-      "patterns": [
-        {
-          "id": "e360f501-668e-435d-ad8a-83ecb94cee06",
-          "pattern": "(x,y)",
-          "expression": "if x>y then [] else [x]^^gen(x+1,y);"
-        }
-      ]
+      "code": "fn addFive(x) {x+5}"
     }
   ],
   "uses": [

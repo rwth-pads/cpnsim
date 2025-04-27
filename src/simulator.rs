@@ -479,11 +479,80 @@ impl Simulator {
                             }
                         } else {
                             // --- Case 3: Complex Inscription (Tuple, Expression, etc.) ---
-                            // This requires evaluating the inscription within the binding's context.
-                            // Not implemented here due to complexity.
-                            println!("Warning: Input arc {} for transition {} has complex inscription '{}' - binding not supported.", arc.id, transition.name, inscription);
-                            // Discard this binding path for now. In a full implementation,
-                            // you'd evaluate the expression and check if the required tokens exist.
+                            // Evaluate the inscription to determine the required tokens.
+                            if let Some(inscription_ast) = self.arc_expressions.get(&arc.id) {
+                                // Create a scope specific to this binding path for evaluation
+                                let mut binding_scope = self.rhai_scope.clone();
+                                for (var, val) in &current_binding.variables {
+                                    binding_scope.push_constant(var, val.clone());
+                                }
+
+                                match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut binding_scope, inscription_ast) {
+                                    Ok(result_dynamic) => {
+                                        let required_tokens = Self::dynamic_to_vec_dynamic(result_dynamic);
+                                        if required_tokens.is_empty() {
+                                            // If the expression evaluates to an empty list, it means no specific tokens are required (like a test arc).
+                                            // Keep the current binding as is, constraint met.
+                                            next_bindings.push(current_binding.clone());
+                                        } else {
+                                            // We need to find if the required tokens are available among the 'available_token_indices'
+                                            // WARNING: This matching logic relies on to_string() and might be incorrect for complex types.
+                                            // It also needs to handle duplicates correctly (multiset matching).
+                                            let mut available_tokens_to_match: Vec<_> = available_token_indices
+                                                .iter()
+                                                .map(|&idx| all_tokens_in_place[idx].clone())
+                                                .collect();
+                                            let mut consumed_for_this_arc = Vec::new();
+                                            let mut possible = true;
+
+                                            for required_token in &required_tokens {
+                                                let required_token_str = required_token.to_string(); // Simplistic comparison
+                                                if let Some(pos) = available_tokens_to_match.iter().position(|avail| avail.to_string() == required_token_str) {
+                                                    // Found a match, remove it from available and add to consumed
+                                                    let matched_token = available_tokens_to_match.remove(pos);
+                                                    consumed_for_this_arc.push(matched_token);
+                                                } else {
+                                                    // Required token not found among available ones
+                                                    possible = false;
+                                                    break;
+                                                }
+                                            }
+
+                                            if possible {
+                                                // All required tokens were found
+                                                let mut new_binding = current_binding.clone();
+                                                new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().extend(consumed_for_this_arc);
+                                                next_bindings.push(new_binding);
+                                            } else {
+                                                // Discard binding path: Required tokens not available.
+                                                // println!("Debug: Discarding binding - required tokens {:?} not found in available {:?}", required_tokens, available_tokens_to_match);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Error evaluating input arc {} inscription '{}' for transition {}: {}",
+                                            arc.id, inscription, transition.name, e
+                                        );
+                                        // Discard binding path on evaluation error
+                                    }
+                                }
+                            } else if !inscription.is_empty() {
+                                // This case should ideally not happen if compilation succeeded
+                                eprintln!(
+                                    "Internal Error: Compiled AST not found for non-empty input arc inscription '{}' (Arc ID: {})",
+                                    inscription, arc.id
+                                );
+                                // Discard binding path
+                            } else {
+                                // Should be handled by Case 2 (Empty Inscription) above.
+                                // If reached, it might indicate an issue in the logic flow.
+                                eprintln!(
+                                    "Internal Warning: Reached complex inscription case with empty inscription for arc {}",
+                                    arc.id
+                                );
+                                next_bindings.push(current_binding.clone()); // Treat as Case 2 for safety?
+                            }
                         }
 
                     } // end loop over current_bindings

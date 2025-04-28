@@ -23,7 +23,6 @@ pub struct WasmSimulator {
 impl WasmSimulator {
     #[wasm_bindgen(constructor)]
     pub fn new(ocpn_json_string: &str) -> Result<WasmSimulator, JsValue> {
-        console_log!("WasmSimulator initialized.");
         let simulator = CoreSimulator::new(ocpn_json_string)
             .map_err(|e| JsValue::from_str(&format!("Initialization error: {}", e)))?;
         

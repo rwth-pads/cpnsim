@@ -9,7 +9,7 @@ extern "C" {
     fn log(s: &str);
 }
 
-macro_rules! console_log {
+macro_rules! _console_log {
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 

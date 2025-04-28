@@ -27,6 +27,7 @@ cfg-if = "1.0"
 rand = "0.9.1"
 rhai = { version = "1.21.0", features = ["sync", "decimal", "serde"] }
 anyhow = "1.0"
+itertools = "0.14.0"
 
 # Conditional dependencies for wasm builds
 wasm-bindgen = { version = "0.2.100", optional = true }

@@ -57,7 +57,7 @@
           "id": "a->b",
           "source": "a",
           "target": "b",
-          "inscription": "var1"
+          "inscription": "[var1,var1]"
         },
         {
           "id": "b->c",

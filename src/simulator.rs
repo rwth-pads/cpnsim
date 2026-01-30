@@ -131,6 +131,47 @@ fn check_and_consume_multiset_multi_place(
     }
 }
 
+/// Check if a variable name appears as a whole word in an inscription.
+/// This avoids false positives like matching "s" in "stop" or "str".
+fn is_variable_in_inscription(var_name: &str, inscription: &str) -> bool {
+    let chars: Vec<char> = inscription.chars().collect();
+    let var_chars: Vec<char> = var_name.chars().collect();
+    let var_len = var_chars.len();
+    
+    if var_len == 0 || chars.len() < var_len {
+        return false;
+    }
+    
+    for i in 0..=chars.len() - var_len {
+        // Check if the substring matches
+        let substring_matches = chars[i..i + var_len].iter().zip(var_chars.iter()).all(|(a, b)| a == b);
+        
+        if substring_matches {
+            // Check if preceded by a non-identifier character (or start of string)
+            let preceded_ok = if i == 0 {
+                true
+            } else {
+                let prev_char = chars[i - 1];
+                !prev_char.is_ascii_alphanumeric() && prev_char != '_'
+            };
+            
+            // Check if followed by a non-identifier character (or end of string)
+            let followed_ok = if i + var_len >= chars.len() {
+                true
+            } else {
+                let next_char = chars[i + var_len];
+                !next_char.is_ascii_alphanumeric() && next_char != '_'
+            };
+            
+            if preceded_ok && followed_ok {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
+
 fn parse_simple_var_array_inscription(inscription: &str) -> (Option<String>, Option<usize>) {
     let trimmed = inscription.trim();
     if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
@@ -593,17 +634,27 @@ impl Simulator {
         // Collect all output arc inscriptions to find unbound range variables
         // and bind them to random values within their range
         let mut rng = rand::rng();
+        let mut already_bound_random: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(net) = self.model.petri_nets.first() {
             for arc in &net.arcs {
-                if arc.source == selected_transition_id {
+                // Check if this is an output arc (source is transition, or bidirectional with target as transition)
+                let is_output_arc = arc.source == selected_transition_id || 
+                    (arc.is_bidirectional && arc.target == selected_transition_id);
+                
+                if is_output_arc {
                     // Find unbound variables used in output arcs that have int range colorsets
                     for (var_name, colorset_name) in &self.declared_variables {
-                        // Skip if already bound
+                        // Skip if already bound from input arcs
                         if selected_binding.variables.contains_key(var_name) {
                             continue;
                         }
-                        // Check if the variable is used in this arc inscription
-                        if !arc.inscription.contains(var_name) {
+                        // Skip if already bound randomly in this loop
+                        if already_bound_random.contains(var_name) {
+                            continue;
+                        }
+                        // Check if the variable is used in this arc inscription (as a whole word, not substring)
+                        // Use regex-like word boundary check: variable must be preceded and followed by non-identifier chars
+                        if !is_variable_in_inscription(var_name, &arc.inscription) {
                             continue;
                         }
                         // Check if this variable has an int range colorset
@@ -612,7 +663,13 @@ impl Simulator {
                                 if let Some((start, end)) = parsed_cs.range {
                                     // Generate random value within range
                                     let random_value = rng.random_range(start..=end);
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        // Log to browser console in WASM
+                                        web_sys::console::log_1(&format!("[WASM] Binding random variable {} to {} (from colorset {} with range {}..{})", var_name, random_value, colorset_name, start, end).into());
+                                    }
                                     firing_scope.push_constant(var_name, Dynamic::from(random_value));
+                                    already_bound_random.insert(var_name.clone());
                                 }
                             }
                         }
@@ -623,11 +680,23 @@ impl Simulator {
 
         if let Some(net) = self.model.petri_nets.first() {
             for arc in &net.arcs {
-                if arc.source == selected_transition_id {
-                    let place_id = &arc.target;
+                // Output arcs: source is transition, OR bidirectional with target as transition
+                let is_output_arc = arc.source == selected_transition_id || 
+                    (arc.is_bidirectional && arc.target == selected_transition_id);
+                
+                if is_output_arc {
+                    // For bidirectional arcs where target is the transition, the place is the source
+                    let place_id = if arc.is_bidirectional && arc.target == selected_transition_id {
+                        &arc.source
+                    } else {
+                        &arc.target
+                    };
                     if let Some(ast) = self.arc_expressions.get(&arc.id) {
+                        eprintln!("[DEBUG] Evaluating output arc {} to place {}: inscription = '{}'", arc.id, place_id, arc.inscription);
+                        eprintln!("[DEBUG] Firing scope variables: {:?}", firing_scope.iter().map(|(n, _, v)| format!("{}={}", n, v)).collect::<Vec<_>>());
                         match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
                             Ok(produced_tokens_dynamic) => {
+                                eprintln!("[DEBUG] Output arc {} produced: {:?}", arc.id, produced_tokens_dynamic);
                                 // Check if the target place has a product colorset
                                 let is_product_place = self.is_place_product_type(place_id);
                                 
@@ -756,10 +825,19 @@ impl Simulator {
         if let Some(net) = self.model.petri_nets.first() {
             for transition in &net.transitions {
                 let mut potential_bindings: Vec<Binding> = vec![Binding::new()];
-                let input_arcs: Vec<_> = net.arcs.iter().filter(|a| a.target == transition.id).collect();
+                // Input arcs: target is transition, OR bidirectional with source as transition
+                let input_arcs: Vec<_> = net.arcs.iter().filter(|a| {
+                    a.target == transition.id || 
+                    (a.is_bidirectional && a.source == transition.id)
+                }).collect();
 
                 for arc in &input_arcs {
-                    let place_id = &arc.source;
+                    // For bidirectional arcs where source is the transition, the place is the target
+                    let place_id = if arc.is_bidirectional && arc.source == transition.id {
+                        &arc.target
+                    } else {
+                        &arc.source
+                    };
                     let inscription = &arc.inscription;
                     let mut next_bindings_for_arc = Vec::new();
 

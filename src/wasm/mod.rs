@@ -10,7 +10,7 @@ extern "C" {
     fn log(s: &str);
 }
 
-macro_rules! _console_log {
+macro_rules! console_log {
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
@@ -24,9 +24,11 @@ pub struct WasmSimulator {
 impl WasmSimulator {
     #[wasm_bindgen(constructor)]
     pub fn new(ocpn_json_string: &str) -> Result<WasmSimulator, JsValue> {
+        console_log!("[WASM] Creating simulator...");
         let simulator = CoreSimulator::new(ocpn_json_string)
             .map_err(|e| JsValue::from_str(&format!("Initialization error: {}", e)))?;
         
+        console_log!("[WASM] Simulator created, current marking: {:?}", simulator.get_all_markings());
         Ok(WasmSimulator { simulator, event_listener: None })
     }
 
@@ -37,8 +39,10 @@ impl WasmSimulator {
 
     #[wasm_bindgen]
     pub fn run_step(&mut self) -> Result<JsValue, JsValue> {
+        console_log!("[WASM] run_step called, current marking: {:?}", self.simulator.get_all_markings());
         match self.simulator.run_step() {
             Some(event_data) => {
+                console_log!("[WASM] Transition fired: {:?}", event_data.transition_id);
                 let event_data_js = to_value(&event_data)
                     .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
 
@@ -48,7 +52,10 @@ impl WasmSimulator {
 
                 Ok(event_data_js)
             }
-            None => Ok(JsValue::NULL),
+            None => {
+                console_log!("[WASM] No transition enabled");
+                Ok(JsValue::NULL)
+            }
         }
     }
 }

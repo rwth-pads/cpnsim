@@ -68,6 +68,8 @@ pub struct Arc {
     pub source: String, // ID of source node (Place or Transition)
     pub target: String, // ID of target node (Place or Transition)
     pub inscription: String, // Rhai expression string
+    #[serde(default)]
+    pub is_bidirectional: bool, // True if arc goes both directions
 }
 
 // --- Declarations ---

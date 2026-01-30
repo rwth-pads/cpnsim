@@ -2,7 +2,7 @@
 name = "cpnsim"
 version = "0.2.0"
 authors = ["István Koren"]
-edition = "2021"
+edition = "2024"
 license = "MIT"
 description = "CPNsim is a Rust library  and command-line tool with WebAssembly target for simulating Colored Petri Nets (CPNs)"
 repository = "https://github.com/rwth-pads/cpnsim"
@@ -18,6 +18,7 @@ wasm = [
     "serde-wasm-bindgen",
     "getrandom/wasm_js",
     "rhai/wasm-bindgen",
+    "web-sys",
 ]
 
 [dependencies]
@@ -33,6 +34,7 @@ itertools = "0.14.0"
 wasm-bindgen = { version = "0.2.100", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6.5", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["console"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]

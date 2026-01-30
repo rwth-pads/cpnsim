@@ -1,4 +1,5 @@
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsValue;
 use crate::CoreSimulator;
 use js_sys::Function;
 use serde_wasm_bindgen::to_value;

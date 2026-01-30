@@ -158,6 +158,55 @@ fn parse_simple_var_array_inscription(inscription: &str) -> (Option<String>, Opt
     }
 }
 
+/// Parses a product-style inscription like `[n, p]` into a list of variable names.
+/// Returns None if the inscription is not a valid product pattern.
+fn parse_product_inscription(inscription: &str) -> Option<Vec<String>> {
+    let trimmed = inscription.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    let inner = trimmed[1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+    if parts.is_empty() || parts.len() < 2 {
+        return None;
+    }
+
+    // Check that all parts are valid variable names (identifiers)
+    let mut var_names = Vec::new();
+    for part in parts {
+        if part.is_empty() {
+            return None;
+        }
+        // Check if it's a valid identifier (starts with letter or underscore, followed by alphanumeric or underscore)
+        if !part.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_') {
+            return None;
+        }
+        if !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        var_names.push(part.to_string());
+    }
+
+    Some(var_names)
+}
+
+/// Checks if a token is a product (array) and extracts its components.
+fn extract_product_components(token: &Dynamic) -> Option<Vec<Dynamic>> {
+    if let Ok(arr) = token.clone().into_typed_array::<Dynamic>() {
+        if arr.len() >= 2 {
+            Some(arr)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ColorSetKind {
     Unit,
@@ -169,6 +218,7 @@ enum ColorSetKind {
     String,
     IntRange,
     List,
+    Product,
     Unknown,
 }
 
@@ -177,6 +227,8 @@ struct ParsedColorSet {
     kind: ColorSetKind,
     base_type_name: Option<String>,
     range: Option<(i64, i64)>,
+    /// For product types, the list of component colorset names
+    component_types: Option<Vec<String>>,
 }
 
 impl ParsedColorSet {
@@ -185,6 +237,7 @@ impl ParsedColorSet {
             kind: ColorSetKind::Unknown,
             base_type_name: None,
             range: None,
+            component_types: None,
         }
     }
 }
@@ -291,6 +344,22 @@ impl Simulator {
                         eprintln!("Warning: Could not parse list element type in definition: {}", definition);
                     }
                 }
+            } else if definition.starts_with("colset ") && definition.contains("= product ") && definition.ends_with(";") {
+                // Parse product types like "colset INTxDATA = product INT * DATA;"
+                if let Some(product_part) = definition.split("= product ").nth(1) {
+                    if let Some(types_str) = product_part.split(';').next() {
+                        let component_types: Vec<String> = types_str
+                            .split('*')
+                            .map(|s| s.trim().to_string())
+                            .collect();
+                        if !component_types.is_empty() {
+                            parsed_cs.kind = ColorSetKind::Product;
+                            parsed_cs.component_types = Some(component_types);
+                        } else {
+                            eprintln!("Warning: Could not parse product component types in definition: {}", definition);
+                        }
+                    }
+                }
             } else {
                 eprintln!("Warning: Unrecognized colorset definition format for '{}': {}", name, definition);
             }
@@ -330,6 +399,45 @@ impl Simulator {
                     eprintln!("{}", err_msg);
                     return Err(err_msg);
                 }
+            }
+        }
+
+        // Process "uses" (constant/value definitions) and add them to the scope
+        for use_def in &model_data.uses {
+            let content = use_def.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            
+            // Parse SML-style val definitions like: val stop = "########";
+            // and convert them to Rhai constant definitions
+            if content.starts_with("val ") && content.contains('=') {
+                // Parse: val name = value;
+                if let Some(rest) = content.strip_prefix("val ") {
+                    let parts: Vec<&str> = rest.splitn(2, '=').collect();
+                    if parts.len() == 2 {
+                        let var_name = parts[0].trim();
+                        let mut value_str = parts[1].trim();
+                        // Remove trailing semicolon if present
+                        if value_str.ends_with(';') {
+                            value_str = value_str[..value_str.len()-1].trim();
+                        }
+                        
+                        // Evaluate the value expression
+                        match engine.eval_expression::<Dynamic>(value_str) {
+                            Ok(value) => {
+                                scope.push_constant(var_name, value);
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: Could not evaluate use definition '{}': {}", use_def.name, e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Try to evaluate as Rhai code directly (for let/const statements)
+                // This won't work for Module compilation, so we try expression evaluation
+                eprintln!("Warning: Unrecognized use definition format for '{}': {}", use_def.name, content);
             }
         }
 
@@ -482,6 +590,37 @@ impl Simulator {
             firing_scope.push_constant(var, value.clone());
         }
 
+        // Collect all output arc inscriptions to find unbound range variables
+        // and bind them to random values within their range
+        let mut rng = rand::rng();
+        if let Some(net) = self.model.petri_nets.first() {
+            for arc in &net.arcs {
+                if arc.source == selected_transition_id {
+                    // Find unbound variables used in output arcs that have int range colorsets
+                    for (var_name, colorset_name) in &self.declared_variables {
+                        // Skip if already bound
+                        if selected_binding.variables.contains_key(var_name) {
+                            continue;
+                        }
+                        // Check if the variable is used in this arc inscription
+                        if !arc.inscription.contains(var_name) {
+                            continue;
+                        }
+                        // Check if this variable has an int range colorset
+                        if let Some(parsed_cs) = self.parsed_color_sets.get(colorset_name) {
+                            if parsed_cs.kind == ColorSetKind::IntRange {
+                                if let Some((start, end)) = parsed_cs.range {
+                                    // Generate random value within range
+                                    let random_value = rng.random_range(start..=end);
+                                    firing_scope.push_constant(var_name, Dynamic::from(random_value));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(net) = self.model.petri_nets.first() {
             for arc in &net.arcs {
                 if arc.source == selected_transition_id {
@@ -489,7 +628,38 @@ impl Simulator {
                     if let Some(ast) = self.arc_expressions.get(&arc.id) {
                         match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
                             Ok(produced_tokens_dynamic) => {
-                                let tokens_to_add = Self::dynamic_to_vec_dynamic(produced_tokens_dynamic);
+                                // Check if the target place has a product colorset
+                                let is_product_place = self.is_place_product_type(place_id);
+                                
+                                let tokens_to_add = if is_product_place {
+                                    // For product places, check if the result is an array representing a single product token
+                                    // or an array of product tokens (e.g., from a conditional that returns multiple)
+                                    if let Ok(arr) = produced_tokens_dynamic.clone().into_typed_array::<Dynamic>() {
+                                        // Check if this looks like a product value (array with mixed types)
+                                        // vs an array of product values (array of arrays)
+                                        if !arr.is_empty() {
+                                            // If first element is also an array, it's likely an array of products
+                                            if arr[0].clone().into_typed_array::<Dynamic>().is_ok() {
+                                                // Array of product tokens
+                                                arr
+                                            } else {
+                                                // Single product token - wrap it
+                                                vec![produced_tokens_dynamic]
+                                            }
+                                        } else {
+                                            // Empty array means no tokens
+                                            vec![]
+                                        }
+                                    } else if produced_tokens_dynamic.is_unit() {
+                                        vec![]
+                                    } else {
+                                        vec![produced_tokens_dynamic]
+                                    }
+                                } else {
+                                    // For non-product places, use the original logic
+                                    Self::dynamic_to_vec_dynamic(produced_tokens_dynamic)
+                                };
+                                
                                 if !tokens_to_add.is_empty() {
                                     produced_tokens_event.entry(place_id.clone()).or_default().extend(tokens_to_add.clone());
                                     self.current_marking.entry(place_id.clone()).or_default().extend(tokens_to_add);
@@ -706,6 +876,50 @@ impl Simulator {
                                         }
                                         Err(e) => {
                                             if let EvalAltResult::ErrorVariableNotFound(ref name, ..) = *e {
+                                                // First, try to parse as a product inscription like [n, p]
+                                                if let Some(var_names) = parse_product_inscription(inscription) {
+                                                    // Check if this is a product-typed place and the first missing var matches
+                                                    if self.is_place_product_type(place_id) && var_names.contains(&name.to_string()) {
+                                                        // This is a product inscription - try to bind from product tokens
+                                                        let mut unique_tokens_processed = HashSet::new();
+                                                        for token in &available_tokens_here {
+                                                            let token_str = token.to_string();
+                                                            if unique_tokens_processed.insert(token_str) {
+                                                                // Try to extract product components
+                                                                if let Some(components) = extract_product_components(token) {
+                                                                    if components.len() == var_names.len() {
+                                                                        // Check if bound variables match, and bind unbound ones
+                                                                        let mut new_binding = current_binding.clone();
+                                                                        let mut all_match = true;
+
+                                                                        for (i, var_name) in var_names.iter().enumerate() {
+                                                                            let component = &components[i];
+                                                                            if let Some(existing_val) = current_binding.variables.get(var_name) {
+                                                                                // Variable already bound - check if it matches
+                                                                                if existing_val.to_string() != component.to_string() {
+                                                                                    all_match = false;
+                                                                                    break;
+                                                                                }
+                                                                            } else {
+                                                                                // Bind the variable to this component
+                                                                                new_binding.variables.insert(var_name.clone(), component.clone());
+                                                                            }
+                                                                        }
+
+                                                                        if all_match {
+                                                                            new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
+                                                                            next_bindings_for_arc.push(new_binding);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        // Continue to next binding even if no matches found (it will be filtered out naturally)
+                                                        continue;
+                                                    }
+                                                }
+
+                                                // Fall back to simple var array inscription handling
                                                 let (var_name_opt, required_count_opt) = parse_simple_var_array_inscription(inscription);
                                                 if let (Some(var_name), Some(required_count)) = (var_name_opt, required_count_opt) {
                                                     if var_name == *name && !current_binding.variables.contains_key(&var_name) && !self.is_list_variable(&var_name) {
@@ -730,7 +944,33 @@ impl Simulator {
                                                         eprintln!("Eval Error (VarNotFound, Mismatch/Bound/List): Arc {}, Inscription '{}', Transition {}: {}. Variable '{}' involved.", arc.id, inscription, transition.name, e, name);
                                                     }
                                                 } else {
-                                                    eprintln!("Eval Error (VarNotFound, Unhandled Pattern): Arc {}, Inscription '{}', Transition {}: {}. Requires unbound var '{}'.", arc.id, inscription, transition.name, e, name);
+                                                    // Check if the missing variable is a declared variable that should be bound from this place
+                                                    // This handles complex inscriptions like "if n == k && p != stop { str + p } else { str }"
+                                                    // where 'str' needs to be bound from the place's tokens
+                                                    let missing_var = name.to_string();
+                                                    if self.declared_variables.contains_key(&missing_var) && !current_binding.variables.contains_key(&missing_var) {
+                                                        // Check if the missing variable's colorset matches the place's colorset
+                                                        let var_colorset = self.declared_variables.get(&missing_var);
+                                                        let place_colorset = self.get_place_colorset(place_id);
+                                                        
+                                                        if var_colorset == place_colorset.as_ref() {
+                                                            // Bind the variable from available tokens and consume one token
+                                                            let mut unique_tokens_processed = HashSet::new();
+                                                            for token in &available_tokens_here {
+                                                                if unique_tokens_processed.insert(token.to_string()) {
+                                                                    let mut new_binding = current_binding.clone();
+                                                                    new_binding.variables.insert(missing_var.clone(), token.clone());
+                                                                    new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
+                                                                    next_bindings_for_arc.push(new_binding);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            eprintln!("Eval Error (VarNotFound, Type Mismatch): Arc {}, Inscription '{}', Transition {}: Variable '{}' has colorset {:?} but place has {:?}.", 
+                                                                arc.id, inscription, transition.name, missing_var, var_colorset, place_colorset);
+                                                        }
+                                                    } else {
+                                                        eprintln!("Eval Error (VarNotFound, Unhandled Pattern): Arc {}, Inscription '{}', Transition {}: {}. Requires unbound var '{}'.", arc.id, inscription, transition.name, e, name);
+                                                    }
                                                 }
                                             } else {
                                                 eprintln!("Eval Error (Other): Arc {}, Inscription '{}', Transition {}: {}", arc.id, inscription, transition.name, e);
@@ -984,5 +1224,75 @@ impl Simulator {
                 None
             }
         })
+    }
+
+    /// Checks if a colorset name refers to a product type.
+    fn is_product_colorset(&self, name: &str) -> bool {
+        self.parsed_color_sets.get(name).map_or(false, |cs| cs.kind == ColorSetKind::Product)
+    }
+
+    /// Gets the component types of a product colorset.
+    #[allow(dead_code)]
+    fn get_product_component_types(&self, name: &str) -> Option<&Vec<String>> {
+        self.parsed_color_sets.get(name).and_then(|cs| {
+            if cs.kind == ColorSetKind::Product {
+                cs.component_types.as_ref()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Checks if a place (by ID) has a product colorset.
+    fn is_place_product_type(&self, place_id: &str) -> bool {
+        if let Some(net) = self.model.petri_nets.first() {
+            if let Some(place) = net.places.iter().find(|p| p.id == place_id) {
+                return self.is_product_colorset(&place.color_set);
+            }
+        }
+        false
+    }
+
+    /// Gets the colorset name for a place by ID.
+    fn get_place_colorset(&self, place_id: &str) -> Option<String> {
+        if let Some(net) = self.model.petri_nets.first() {
+            if let Some(place) = net.places.iter().find(|p| p.id == place_id) {
+                return Some(place.color_set.clone());
+            }
+        }
+        None
+    }
+
+    /// Checks if all variables in a product inscription are declared and their types 
+    /// match the product colorset component types.
+    #[allow(dead_code)]
+    fn validate_product_binding(&self, var_names: &[String], place_id: &str) -> bool {
+        let colorset_name = match self.get_place_colorset(place_id) {
+            Some(name) => name,
+            None => return false,
+        };
+
+        let component_types = match self.get_product_component_types(&colorset_name) {
+            Some(types) => types,
+            None => return false,
+        };
+
+        if var_names.len() != component_types.len() {
+            return false;
+        }
+
+        // Check that each variable is declared and its type matches the component type
+        for (i, var_name) in var_names.iter().enumerate() {
+            if let Some(var_colorset) = self.declared_variables.get(var_name) {
+                // The variable's colorset should match the component type
+                if var_colorset != &component_types[i] {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
     }
 }

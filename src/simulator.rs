@@ -260,6 +260,7 @@ enum ColorSetKind {
     IntRange,
     List,
     Product,
+    Record,
     Unknown,
 }
 
@@ -270,6 +271,8 @@ struct ParsedColorSet {
     range: Option<(i64, i64)>,
     /// For product types, the list of component colorset names
     component_types: Option<Vec<String>>,
+    /// For record types, the list of (field_name, field_type) pairs
+    record_fields: Option<Vec<(String, String)>>,
 }
 
 impl ParsedColorSet {
@@ -278,6 +281,7 @@ impl ParsedColorSet {
             kind: ColorSetKind::Unknown,
             base_type_name: None,
             range: None,
+            record_fields: None,
             component_types: None,
         }
     }
@@ -298,6 +302,37 @@ fn rust_multiset_equal(list1: Vec<Dynamic>, list2: Vec<Dynamic>) -> bool {
     let counts1 = create_count_map(&list1);
     let counts2 = create_count_map(&list2);
     counts1 == counts2
+}
+
+/// Converts JSON object notation to Rhai map syntax
+/// E.g., {"id":1,"name":"John"} -> #{id: 1, name: "John"}
+/// Handles arrays of objects: [{"id":1},{"id":2}] -> [#{id: 1}, #{id: 2}]
+fn convert_json_to_rhai(json_str: &str) -> Result<String, String> {
+    use serde_json::Value;
+    
+    let parsed: Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("Invalid JSON: {}", e))?;
+    
+    fn value_to_rhai(v: &Value) -> String {
+        match v {
+            Value::Null => "()".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => format!("\"{}\"", s.replace('\"', "\\\"")),
+            Value::Array(arr) => {
+                let elements: Vec<String> = arr.iter().map(value_to_rhai).collect();
+                format!("[{}]", elements.join(", "))
+            }
+            Value::Object(obj) => {
+                let fields: Vec<String> = obj.iter()
+                    .map(|(k, v)| format!("{}: {}", k, value_to_rhai(v)))
+                    .collect();
+                format!("#{{{}}}", fields.join(", "))
+            }
+        }
+    }
+    
+    Ok(value_to_rhai(&parsed))
 }
 
 fn rhai_multiset_equal_wrapper(context: NativeCallContext, a: Dynamic, b: Dynamic) -> Result<bool, Box<EvalAltResult>> {
@@ -401,6 +436,30 @@ impl Simulator {
                         }
                     }
                 }
+            } else if definition.starts_with("colset ") && definition.contains("= record ") && definition.ends_with(";") {
+                // Parse record types like "colset PERSON = record name: STRING * age: INT;"
+                if let Some(record_part) = definition.split("= record ").nth(1) {
+                    if let Some(fields_str) = record_part.split(';').next() {
+                        let fields: Vec<(String, String)> = fields_str
+                            .split('*')
+                            .filter_map(|field| {
+                                let parts: Vec<&str> = field.split(':').map(|s| s.trim()).collect();
+                                if parts.len() == 2 {
+                                    Some((parts[0].to_string(), parts[1].to_string()))
+                                } else {
+                                    eprintln!("Warning: Could not parse record field: {}", field);
+                                    None
+                                }
+                            })
+                            .collect();
+                        if !fields.is_empty() {
+                            parsed_cs.kind = ColorSetKind::Record;
+                            parsed_cs.record_fields = Some(fields);
+                        } else {
+                            eprintln!("Warning: Could not parse record fields in definition: {}", definition);
+                        }
+                    }
+                }
             } else {
                 eprintln!("Warning: Unrecognized colorset definition format for '{}': {}", name, definition);
             }
@@ -485,7 +544,22 @@ impl Simulator {
         for net in &model_data.petri_nets {
             for place in &net.places {
                 if !place.initial_marking.is_empty() && place.initial_marking != "[]" {
-                    match engine.compile_expression(&place.initial_marking) {
+                    // Convert JSON object notation to Rhai map syntax if needed
+                    let marking_expr = if place.initial_marking.trim_start().starts_with('[') && 
+                                           place.initial_marking.contains('{') {
+                        // Looks like JSON with objects - convert to Rhai
+                        match convert_json_to_rhai(&place.initial_marking) {
+                            Ok(rhai_expr) => rhai_expr,
+                            Err(e) => {
+                                eprintln!("Warning: Failed to convert JSON marking for place {}: {}. Trying original.", place.name, e);
+                                place.initial_marking.clone()
+                            }
+                        }
+                    } else {
+                        place.initial_marking.clone()
+                    };
+                    
+                    match engine.compile_expression(&marking_expr) {
                         Ok(ast) => {
                             initial_marking_expressions.insert(place.id.clone(), ast);
                         }

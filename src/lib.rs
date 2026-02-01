@@ -44,4 +44,16 @@ impl CoreSimulator {
     pub fn get_all_markings(&self) -> &HashMap<String, Vec<Dynamic>> {
         self.simulator.get_all_markings()
     }
+
+    /// Get the list of currently enabled transitions.
+    /// Returns a vector of (transition_id, transition_name) pairs.
+    pub fn get_enabled_transitions(&self) -> Vec<(String, String)> {
+        self.simulator.get_enabled_transitions()
+    }
+
+    /// Fire a specific transition by ID.
+    /// Returns the firing event data if successful, None if the transition is not enabled.
+    pub fn fire_transition(&mut self, transition_id: &str) -> Option<FiringEventData> {
+        self.simulator.fire_transition(transition_id)
+    }
 }

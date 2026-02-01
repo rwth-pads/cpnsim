@@ -608,7 +608,8 @@ impl Simulator {
                     if let Ok(tokens) = result.clone().into_typed_array::<Dynamic>() {
                         current_marking.insert(place_id.clone(), tokens);
                     } else if result.is_unit() {
-                        current_marking.insert(place_id.clone(), vec![]);
+                        // A single unit value () represents one unit token
+                        current_marking.insert(place_id.clone(), vec![result]);
                     } else {
                         current_marking.insert(place_id.clone(), vec![result]);
                     }
@@ -794,7 +795,8 @@ impl Simulator {
                                             vec![]
                                         }
                                     } else if produced_tokens_dynamic.is_unit() {
-                                        vec![]
+                                        // Unit value represents one unit token
+                                        vec![produced_tokens_dynamic]
                                     } else {
                                         vec![produced_tokens_dynamic]
                                     }
@@ -856,9 +858,8 @@ impl Simulator {
     pub fn dynamic_to_vec_dynamic(d: Dynamic) -> Vec<Dynamic> {
         if let Ok(arr) = d.clone().into_typed_array::<Dynamic>() {
             arr
-        } else if d.is_unit() {
-            vec![]
         } else {
+            // Single value (including unit) - wrap in vec as one token
             vec![d]
         }
     }
@@ -1344,6 +1345,194 @@ impl Simulator {
 
     pub fn get_all_markings(&self) -> &HashMap<String, Vec<Dynamic>> {
         &self.current_marking
+    }
+
+    /// Get the list of currently enabled transitions.
+    /// Returns a vector of (transition_id, transition_name) pairs.
+    pub fn get_enabled_transitions(&self) -> Vec<(String, String)> {
+        let mut enabled = Vec::new();
+        if let Some(net) = self.model.petri_nets.first() {
+            // We need to check which transitions have at least one valid binding
+            // For now, we use a simplified approach by checking the enabled bindings
+            let mut temp_self = self.clone_for_check();
+            let enabled_bindings = temp_self.find_enabled_bindings();
+            
+            // Collect unique transition IDs that have at least one binding
+            let mut seen_transitions = std::collections::HashSet::new();
+            for (transition_id, _) in enabled_bindings {
+                if !seen_transitions.contains(&transition_id) {
+                    if let Some(transition) = net.transitions.iter().find(|t| t.id == transition_id) {
+                        enabled.push((transition_id.clone(), transition.name.clone()));
+                        seen_transitions.insert(transition_id);
+                    }
+                }
+            }
+        }
+        enabled
+    }
+
+    /// Fire a specific transition by ID.
+    /// Returns the firing event data if successful, None if the transition is not enabled.
+    pub fn fire_transition(&mut self, transition_id: &str) -> Option<FiringEventData> {
+        let enabled_bindings = self.find_enabled_bindings();
+        
+        // Find bindings for the specified transition
+        let bindings_for_transition: Vec<_> = enabled_bindings
+            .into_iter()
+            .filter(|(tid, _)| tid == transition_id)
+            .collect();
+        
+        if bindings_for_transition.is_empty() {
+            return None;
+        }
+        
+        // Pick a random binding for this transition (could be extended to allow specific binding selection)
+        let mut rng = rand::rng();
+        let (selected_transition_id, selected_binding) = bindings_for_transition
+            .into_iter()
+            .choose(&mut rng)
+            .unwrap();
+        
+        // Fire the transition with the selected binding
+        self.fire_transition_with_binding(&selected_transition_id, selected_binding)
+    }
+
+    /// Clone self for read-only checking (used by get_enabled_transitions)
+    fn clone_for_check(&self) -> Self {
+        Simulator {
+            model: self.model.clone(),
+            current_marking: self.current_marking.clone(),
+            rhai_engine: Engine::new(), // Fresh engine for checking
+            rhai_scope: self.rhai_scope.clone(),
+            guards: self.guards.clone(),
+            arc_expressions: self.arc_expressions.clone(),
+            initial_marking_expressions: self.initial_marking_expressions.clone(),
+            declared_variables: self.declared_variables.clone(),
+            parsed_color_sets: self.parsed_color_sets.clone(),
+        }
+    }
+
+    /// Internal method to fire a transition with a specific binding
+    fn fire_transition_with_binding(&mut self, transition_id: &str, selected_binding: Binding) -> Option<FiringEventData> {
+        let transition_to_fire = self.model.find_transition(transition_id)?;
+        
+        let mut consumed_tokens_event: HashMap<String, Vec<Dynamic>> = HashMap::new();
+        let mut produced_tokens_event: HashMap<String, Vec<Dynamic>> = HashMap::new();
+
+        // Consume tokens
+        for (place_id, tokens_to_consume) in &selected_binding.consumed_tokens_map {
+            if let Some(available_tokens) = self.current_marking.get_mut(place_id) {
+                let mut consumed_for_event = Vec::new();
+                let mut remaining_tokens = Vec::new();
+                let mut needed_counts: HashMap<String, usize> = HashMap::new();
+                for token in tokens_to_consume {
+                    *needed_counts.entry(token.to_string()).or_insert(0) += 1;
+                }
+
+                let mut current_counts: HashMap<String, usize> = HashMap::new();
+
+                for token in available_tokens.iter() {
+                    let token_str = token.to_string();
+                    let needed_count = needed_counts.get(&token_str).copied().unwrap_or(0);
+                    let current_count = current_counts.entry(token_str).or_insert(0);
+
+                    if *current_count < needed_count {
+                        consumed_for_event.push(token.clone());
+                        *current_count += 1;
+                    } else {
+                        remaining_tokens.push(token.clone());
+                    }
+                }
+
+                *available_tokens = remaining_tokens;
+                consumed_tokens_event.insert(place_id.clone(), consumed_for_event);
+            }
+        }
+
+        // Set up firing scope with bound variables
+        let mut firing_scope = self.rhai_scope.clone();
+        for (var, value) in &selected_binding.variables {
+            firing_scope.push_constant(var, value.clone());
+        }
+
+        // Handle unbound range variables (same logic as run_step)
+        let mut rng = rand::rng();
+        let mut already_bound_random: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(net) = self.model.petri_nets.first() {
+            for arc in &net.arcs {
+                let is_output_arc = arc.source == *transition_id || 
+                    (arc.is_bidirectional && arc.target == *transition_id);
+                
+                if is_output_arc {
+                    for (var_name, colorset_name) in &self.declared_variables {
+                        if selected_binding.variables.contains_key(var_name) {
+                            continue;
+                        }
+                        if already_bound_random.contains(var_name) {
+                            continue;
+                        }
+                        if !is_variable_in_inscription(var_name, &arc.inscription) {
+                            continue;
+                        }
+                        if let Some(parsed_cs) = self.parsed_color_sets.get(colorset_name) {
+                            if parsed_cs.kind == ColorSetKind::IntRange {
+                                if let Some((start, end)) = parsed_cs.range {
+                                    let random_value = rng.random_range(start..=end);
+                                    firing_scope.push_constant(var_name, Dynamic::from(random_value));
+                                    already_bound_random.insert(var_name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Produce tokens on output arcs
+        if let Some(net) = self.model.petri_nets.first() {
+            let output_arcs: Vec<_> = net.arcs.iter().filter(|a| {
+                a.source == *transition_id || 
+                (a.is_bidirectional && a.target == *transition_id)
+            }).collect();
+
+            for arc in output_arcs {
+                let target_place_id = if arc.is_bidirectional && arc.target == *transition_id {
+                    &arc.source
+                } else {
+                    &arc.target
+                };
+
+                if let Some(ast) = self.arc_expressions.get(&arc.id) {
+                    match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
+                        Ok(result) => {
+                            let tokens_to_produce = if result.is_array() {
+                                result.into_array().unwrap_or_default()
+                            } else {
+                                vec![result]
+                            };
+
+                            let place_tokens = self.current_marking.entry(target_place_id.clone()).or_default();
+                            for token in &tokens_to_produce {
+                                place_tokens.push(token.clone());
+                            }
+                            produced_tokens_event.entry(target_place_id.clone())
+                                .or_default()
+                                .extend(tokens_to_produce);
+                        }
+                        Err(e) => {
+                            eprintln!("Error evaluating output arc {}: {}", arc.id, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(FiringEventData {
+            transition_id: transition_id.to_string(),
+            transition_name: transition_to_fire.name.clone(),
+            consumed: consumed_tokens_event,
+            produced: produced_tokens_event,
+        })
     }
 
     #[allow(dead_code)]

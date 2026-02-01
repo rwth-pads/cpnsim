@@ -130,4 +130,37 @@ impl WasmSimulator {
             }
         }
     }
+
+    /// Get the current simulation time in milliseconds
+    #[wasm_bindgen(js_name = getCurrentTime)]
+    pub fn get_current_time(&self) -> i64 {
+        self.simulator.get_current_time()
+    }
+
+    /// Set the current simulation time in milliseconds
+    #[wasm_bindgen(js_name = setCurrentTime)]
+    pub fn set_current_time(&mut self, time: i64) {
+        self.simulator.set_current_time(time);
+    }
+
+    /// Get the simulation epoch as an ISO 8601 string (or null if not set)
+    #[wasm_bindgen(js_name = getSimulationEpoch)]
+    pub fn get_simulation_epoch(&self) -> JsValue {
+        match self.simulator.get_simulation_epoch() {
+            Some(epoch) => JsValue::from_str(epoch),
+            None => JsValue::NULL,
+        }
+    }
+
+    /// Set the simulation epoch (ISO 8601 string, or null to clear)
+    #[wasm_bindgen(js_name = setSimulationEpoch)]
+    pub fn set_simulation_epoch(&mut self, epoch: Option<String>) {
+        self.simulator.set_simulation_epoch(epoch);
+    }
+
+    /// Advance simulation time by a given delta in milliseconds
+    #[wasm_bindgen(js_name = advanceTime)]
+    pub fn advance_time(&mut self, delta_ms: i64) {
+        self.simulator.advance_time(delta_ms);
+    }
 }

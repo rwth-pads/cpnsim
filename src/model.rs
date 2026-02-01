@@ -15,6 +15,8 @@ pub struct PetriNetData {
     pub priorities: Vec<Priority>,
     pub functions: Vec<FunctionDefinition>,
     pub uses: Vec<UseDefinition>,
+    #[serde(default)]
+    pub simulation_epoch: Option<String>, // ISO 8601 datetime string for simulation start time
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -84,6 +86,8 @@ pub struct ColorSet {
     pub type_field: String, // e.g., "basic", "product", "record", "list", "union"
     pub definition: String, // e.g., "colset INT = int;"
     pub color: String, // UI color hex code
+    #[serde(default)]
+    pub timed: bool, // Whether tokens of this color set carry timestamps
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -145,6 +149,7 @@ pub struct Size {
 pub struct FiringEventData {
     pub transition_id: String,
     pub transition_name: String,
+    pub simulation_time: i64, // Simulation time in milliseconds when the transition fired
     // Change back to Dynamic
     pub consumed: HashMap<String, Vec<Dynamic>>,
     // Change back to Dynamic

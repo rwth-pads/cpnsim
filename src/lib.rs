@@ -56,4 +56,29 @@ impl CoreSimulator {
     pub fn fire_transition(&mut self, transition_id: &str) -> Option<FiringEventData> {
         self.simulator.fire_transition(transition_id)
     }
+
+    /// Get the current simulation time in milliseconds
+    pub fn get_current_time(&self) -> i64 {
+        self.simulator.get_current_time()
+    }
+
+    /// Set the current simulation time in milliseconds
+    pub fn set_current_time(&mut self, time: i64) {
+        self.simulator.set_current_time(time)
+    }
+
+    /// Get the simulation epoch (ISO 8601 string)
+    pub fn get_simulation_epoch(&self) -> Option<&String> {
+        self.simulator.get_simulation_epoch()
+    }
+
+    /// Set the simulation epoch (ISO 8601 string)
+    pub fn set_simulation_epoch(&mut self, epoch: Option<String>) {
+        self.simulator.set_simulation_epoch(epoch)
+    }
+
+    /// Advance simulation time by a given delta in milliseconds
+    pub fn advance_time(&mut self, delta_ms: i64) {
+        self.simulator.advance_time(delta_ms)
+    }
 }

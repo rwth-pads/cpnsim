@@ -342,18 +342,139 @@ fn rhai_multiset_equal_wrapper(context: NativeCallContext, a: Dynamic, b: Dynami
     Ok(rust_multiset_equal(vec_a, vec_b))
 }
 
+/// Represents a token with an optional timestamp (for timed color sets).
+/// The timestamp is in milliseconds relative to the simulation epoch.
+/// A token is "ready" when current_time >= timestamp.
+#[derive(Debug, Clone)]
+pub struct TimedToken {
+    pub value: Dynamic,
+    pub timestamp: i64, // Availability time in milliseconds (0 = immediately available)
+}
+
+impl TimedToken {
+    pub fn new(value: Dynamic, timestamp: i64) -> Self {
+        TimedToken { value, timestamp }
+    }
+    
+    pub fn immediate(value: Dynamic) -> Self {
+        TimedToken { value, timestamp: 0 }
+    }
+    
+    pub fn is_ready(&self, current_time: i64) -> bool {
+        self.timestamp <= current_time
+    }
+}
+
+impl std::fmt::Display for TimedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.timestamp == 0 {
+            write!(f, "{}", self.value)
+        } else {
+            write!(f, "{}@{}", self.value, self.timestamp)
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct Simulator {
     model: PetriNetData,
+    // Each place stores a list of token values (kept as Dynamic for compatibility)
     current_marking: HashMap<String, Vec<Dynamic>>,
+    // Parallel structure: token timestamps by place_id, indexed same as current_marking
+    token_timestamps: HashMap<String, Vec<i64>>,
+    // Current simulation time in milliseconds
+    current_time: i64,
+    // Simulation epoch as ISO 8601 string (for display purposes)
+    simulation_epoch: Option<String>,
+    // Map of place_id -> is_timed (whether the place's colorset is timed)
+    timed_places: HashMap<String, bool>,
     rhai_engine: Engine,
     rhai_scope: Scope<'static>,
     guards: HashMap<String, AST>,
     arc_expressions: HashMap<String, AST>,
     initial_marking_expressions: HashMap<String, AST>,
+    // Compiled transition time expressions (transition_id -> AST)
+    time_expressions: HashMap<String, AST>,
     declared_variables: HashMap<String, String>,
     parsed_color_sets: HashMap<String, ParsedColorSet>,
+}
+
+// ============================================================================
+// Rhai delay module - provides time delay functions for timed Petri nets
+// All delays are expressed in milliseconds internally
+// ============================================================================
+
+/// Delay in milliseconds
+fn delay_ms(ms: i64) -> i64 {
+    ms
+}
+
+/// Delay in seconds
+fn delay_sec(seconds: i64) -> i64 {
+    seconds * 1000
+}
+
+/// Delay in minutes  
+fn delay_min(minutes: i64) -> i64 {
+    minutes * 60 * 1000
+}
+
+/// Delay in hours
+fn delay_hours(hours: i64) -> i64 {
+    hours * 60 * 60 * 1000
+}
+
+/// Delay in days
+fn delay_days(days: i64) -> i64 {
+    days * 24 * 60 * 60 * 1000
+}
+
+/// Register the delay module with a Rhai engine
+fn register_delay_module(engine: &mut Engine) {
+    // Register delay functions with "delay_" prefix for direct access
+    engine.register_fn("delay_ms", delay_ms);
+    engine.register_fn("delay_sec", delay_sec);
+    engine.register_fn("delay_min", delay_min);
+    engine.register_fn("delay_hours", delay_hours);
+    engine.register_fn("delay_days", delay_days);
+}
+
+/// Extract the actual value from a token, handling both timed and non-timed formats.
+/// For timed tokens (Rhai maps with "value" and "timestamp" fields), returns the "value" field.
+/// For non-timed tokens, returns the token as-is.
+fn extract_token_value(token: &Dynamic) -> Dynamic {
+    // Check if this is a Rhai map (object) with a "value" field
+    if token.is_map() {
+        if let Some(map) = token.read_lock::<rhai::Map>() {
+            if let Some(value) = map.get("value") {
+                return value.clone();
+            }
+        }
+    }
+    // Not a timed token map, return as-is
+    token.clone()
+}
+
+/// Extract the timestamp from a timed token (Rhai map).
+/// Returns 0 if not a timed token or if timestamp field is missing.
+fn extract_token_timestamp(token: &Dynamic) -> i64 {
+    if token.is_map() {
+        if let Some(map) = token.read_lock::<rhai::Map>() {
+            if let Some(ts) = map.get("timestamp") {
+                return ts.as_int().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
+/// Create a timed token (Rhai map with "value" and "timestamp" fields)
+fn create_timed_token(value: Dynamic, timestamp: i64) -> Dynamic {
+    let mut map = rhai::Map::new();
+    map.insert("value".into(), value);
+    map.insert("timestamp".into(), Dynamic::from(timestamp));
+    Dynamic::from(map)
 }
 
 impl Simulator {
@@ -362,17 +483,30 @@ impl Simulator {
         let mut scope = Scope::new();
 
         engine.register_fn("multiset_equal", rhai_multiset_equal_wrapper);
+        
+        // Register delay module for timed simulations
+        register_delay_module(&mut engine);
 
         let mut guards = HashMap::new();
         let mut arc_expressions = HashMap::new();
         let mut initial_marking_expressions = HashMap::new();
+        let mut time_expressions: HashMap<String, AST> = HashMap::new();
 
         let mut current_marking: HashMap<String, Vec<Dynamic>> = HashMap::new();
+        let mut token_timestamps: HashMap<String, Vec<i64>> = HashMap::new();
         let mut declared_variables: HashMap<String, String> = HashMap::new();
         let mut parsed_color_sets: HashMap<String, ParsedColorSet> = HashMap::new();
+        let mut timed_colorsets: HashSet<String> = HashSet::new();
 
         for var in &model_data.variables {
             declared_variables.insert(var.name.clone(), var.color_set.clone());
+        }
+
+        // First pass: identify timed color sets
+        for cs in &model_data.color_sets {
+            if cs.timed {
+                timed_colorsets.insert(cs.name.clone());
+            }
         }
 
         for cs in &model_data.color_sets {
@@ -585,6 +719,28 @@ impl Simulator {
                         }
                     }
                 }
+                // Compile transition time expression if present
+                // Time expressions can have "@+" prefix (CPN Tools format) - strip it
+                let time_expr = transition.time.trim();
+                let time_expr = if time_expr.starts_with("@+") {
+                    time_expr[2..].trim()
+                } else if time_expr.starts_with("@") {
+                    time_expr[1..].trim()
+                } else {
+                    time_expr
+                };
+                if !time_expr.is_empty() {
+                    match engine.compile_expression(time_expr) {
+                        Ok(ast) => {
+                            time_expressions.insert(transition.id.clone(), ast);
+                        }
+                        Err(e) => {
+                            let err_msg = format!("Error compiling time expression for transition {}: {}", transition.name, e);
+                            eprintln!("{}", err_msg);
+                            return Err(err_msg);
+                        }
+                    }
+                }
             }
             for arc in &net.arcs {
                 if !arc.inscription.is_empty() {
@@ -605,14 +761,18 @@ impl Simulator {
         for (place_id, ast) in &initial_marking_expressions {
             match engine.eval_ast_with_scope::<Dynamic>(&mut scope, ast) {
                 Ok(result) => {
-                    if let Ok(tokens) = result.clone().into_typed_array::<Dynamic>() {
-                        current_marking.insert(place_id.clone(), tokens);
+                    let tokens: Vec<Dynamic> = if let Ok(token_values) = result.clone().into_typed_array::<Dynamic>() {
+                        token_values
                     } else if result.is_unit() {
                         // A single unit value () represents one unit token
-                        current_marking.insert(place_id.clone(), vec![result]);
+                        vec![result]
                     } else {
-                        current_marking.insert(place_id.clone(), vec![result]);
-                    }
+                        vec![result]
+                    };
+                    // Initialize timestamps to 0 (immediately available)
+                    let timestamps: Vec<i64> = vec![0; tokens.len()];
+                    current_marking.insert(place_id.clone(), tokens);
+                    token_timestamps.insert(place_id.clone(), timestamps);
                 }
                 Err(e) => {
                     let err_msg = format!("Error evaluating initial marking for place {}: {}", place_id, e);
@@ -622,21 +782,59 @@ impl Simulator {
             }
         }
 
+        // Build timed_places map by checking each place's colorset
+        let mut timed_places: HashMap<String, bool> = HashMap::new();
+        for net in &model_data.petri_nets {
+            for place in &net.places {
+                let is_timed = timed_colorsets.contains(&place.color_set);
+                timed_places.insert(place.id.clone(), is_timed);
+                // Initialize token_timestamps for each place if not already done
+                token_timestamps.entry(place.id.clone()).or_insert_with(Vec::new);
+            }
+        }
+
+        // Get simulation epoch from model
+        let simulation_epoch = model_data.simulation_epoch.clone();
+
         Ok(Simulator {
             model: model_data,
             current_marking,
+            token_timestamps,
+            current_time: 0,
+            simulation_epoch,
+            timed_places,
             rhai_engine: engine,
             rhai_scope: scope,
             guards,
             arc_expressions,
             initial_marking_expressions,
+            time_expressions,
             declared_variables,
             parsed_color_sets,
         })
     }
 
     pub fn run_step(&mut self) -> Option<FiringEventData> {
-        let enabled_bindings = self.find_enabled_bindings();
+        let mut enabled_bindings = self.find_enabled_bindings();
+        
+        // If no bindings found, check for future tokens and advance time if needed
+        if enabled_bindings.is_empty() {
+            if let Some(earliest_future_time) = self.find_earliest_future_token_time() {
+                // Advance simulation time to when the next token becomes available
+                #[cfg(target_arch = "wasm32")]
+                {
+                    web_sys::console::log_1(&format!(
+                        "[WASM] No transition enabled at time {}, advancing to {}",
+                        self.current_time, earliest_future_time
+                    ).into());
+                }
+                self.current_time = earliest_future_time;
+                
+                // Try finding bindings again at the new time
+                enabled_bindings = self.find_enabled_bindings();
+            }
+        }
+        
         if enabled_bindings.is_empty() {
             return None;
         }
@@ -649,10 +847,11 @@ impl Simulator {
         let mut consumed_tokens_event: HashMap<String, Vec<Dynamic>> = HashMap::new();
         let mut produced_tokens_event: HashMap<String, Vec<Dynamic>> = HashMap::new();
 
+        // tokens_to_consume contains Dynamic values
         for (place_id, tokens_to_consume) in &selected_binding.consumed_tokens_map {
             if let Some(available_tokens) = self.current_marking.get_mut(place_id) {
-                let mut consumed_for_event = Vec::new();
-                let mut remaining_tokens = Vec::new();
+                let mut consumed_for_event: Vec<Dynamic> = Vec::new();
+                let mut remaining_tokens: Vec<Dynamic> = Vec::new();
                 let mut needed_counts: HashMap<String, usize> = HashMap::new();
                 for token in tokens_to_consume {
                     *needed_counts.entry(token.to_string()).or_insert(0) += 1;
@@ -753,6 +952,32 @@ impl Simulator {
             }
         }
 
+        // Evaluate transition time expression to get delay for produced tokens
+        let time_delay: i64 = if let Some(time_ast) = self.time_expressions.get(&selected_transition_id) {
+            match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, time_ast) {
+                Ok(result) => {
+                    let delay = result.as_int().unwrap_or(0);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        web_sys::console::log_1(&format!(
+                            "[WASM] Transition {} time delay: {} ms",
+                            transition_to_fire.name, delay
+                        ).into());
+                    }
+                    delay
+                }
+                Err(e) => {
+                    eprintln!("Error evaluating time expression for transition {}: {}", transition_to_fire.name, e);
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        // Calculate the timestamp for produced tokens (current_time + time_delay)
+        let produced_token_time = self.current_time + time_delay;
+
         if let Some(net) = self.model.petri_nets.first() {
             for arc in &net.arcs {
                 // Output arcs: source is transition, OR bidirectional with target as transition
@@ -806,8 +1031,36 @@ impl Simulator {
                                 };
                                 
                                 if !tokens_to_add.is_empty() {
-                                    produced_tokens_event.entry(place_id.clone()).or_default().extend(tokens_to_add.clone());
-                                    self.current_marking.entry(place_id.clone()).or_default().extend(tokens_to_add);
+                                    // Check if target place is timed
+                                    let is_timed = self.timed_places.get(place_id).copied().unwrap_or(false);
+                                    
+                                    // For timed places, wrap tokens as timed token objects
+                                    // Use produced_token_time which includes the transition's time delay
+                                    let tokens_for_marking: Vec<Dynamic> = if is_timed {
+                                        tokens_to_add.iter().map(|t| {
+                                            // If it's already a timed token, preserve it; otherwise create one
+                                            if t.is_map() {
+                                                if let Some(map) = t.read_lock::<rhai::Map>() {
+                                                    if map.contains_key("value") && map.contains_key("timestamp") {
+                                                        return t.clone();
+                                                    }
+                                                }
+                                            }
+                                            create_timed_token(t.clone(), produced_token_time)
+                                        }).collect()
+                                    } else {
+                                        tokens_to_add.clone()
+                                    };
+                                    
+                                    // Store timed tokens in both event and marking
+                                    produced_tokens_event.entry(place_id.clone()).or_default().extend(tokens_for_marking.clone());
+                                    self.current_marking.entry(place_id.clone()).or_default().extend(tokens_for_marking.clone());
+                                    
+                                    // Also update parallel timestamp array for consistency
+                                    let timestamps = self.token_timestamps.entry(place_id.clone()).or_default();
+                                    for _ in 0..tokens_to_add.len() {
+                                        timestamps.push(produced_token_time);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -828,6 +1081,7 @@ impl Simulator {
         let event_data = FiringEventData {
             transition_id: selected_transition_id,
             transition_name: transition_to_fire.name.clone(),
+            simulation_time: self.current_time,
             consumed: consumed_tokens_event,
             produced: produced_tokens_event,
         };
@@ -873,7 +1127,9 @@ impl Simulator {
     fn get_available_token_indices_with_place<'a>(
         place_id: &'a str,
         all_tokens_in_place: &'a [Dynamic],
+        token_timestamps: &'a [i64],
         consumed_in_binding: Option<&Vec<Dynamic>>,
+        current_time: i64,
     ) -> Vec<(&'a str, usize, Dynamic)> {
         let consumed_counts = consumed_in_binding
             .map(|tokens| create_count_map(tokens))
@@ -882,6 +1138,17 @@ impl Simulator {
         let mut available_tokens_info = Vec::new();
         let mut current_token_counts_in_place = HashMap::new();
         for (index, token) in all_tokens_in_place.iter().enumerate() {
+            // Check for timestamp - first try parallel array, then check embedded timestamp in token
+            let timestamp = if let Some(&ts) = token_timestamps.get(index) {
+                if ts != 0 { ts } else { extract_token_timestamp(token) }
+            } else {
+                extract_token_timestamp(token)
+            };
+            
+            // Only consider tokens that are ready (timestamp <= current_time)
+            if timestamp > current_time {
+                continue;
+            }
             let token_str = token.to_string();
             let consumed_count = consumed_counts.get(&token_str).copied().unwrap_or(0);
             let current_count = current_token_counts_in_place.entry(token_str.clone()).or_insert(0);
@@ -923,18 +1190,27 @@ impl Simulator {
                             break;
                         }
                     };
+                    
+                    let timestamps_for_place = self.token_timestamps.get(place_id.as_str())
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
 
                     for current_binding in &potential_bindings {
+                        let current_time = self.current_time;
                         let available_tokens_here: Vec<_> = Self::get_available_token_indices_with_place(
                             place_id,
                             all_tokens_in_place,
+                            timestamps_for_place,
                             current_binding.consumed_tokens_map.get(place_id),
+                            current_time,
                         ).into_iter().map(|(_, _, token)| token).collect();
 
                         let available_token_indices: Vec<usize> = Self::get_available_token_indices_with_place(
                             place_id,
                             all_tokens_in_place,
+                            timestamps_for_place,
                             current_binding.consumed_tokens_map.get(place_id),
+                            current_time,
                         ).into_iter().map(|(_, index, _)| index).collect();
 
                         if !inscription.is_empty() && self.declared_variables.contains_key(inscription) {
@@ -962,7 +1238,9 @@ impl Simulator {
                                     let bound_value_str = bound_value.to_string();
                                     let mut found_match = false;
                                     for token in &available_tokens_here {
-                                        if token.to_string() == bound_value_str {
+                                        // For timed tokens, compare the extracted value
+                                        let token_value = extract_token_value(token);
+                                        if token_value.to_string() == bound_value_str {
                                             /*
                                             [DEBUG] Found matching token '{}' for variable '{}' in place '{}'
                                             */
@@ -981,12 +1259,15 @@ impl Simulator {
                                 } else {
                                     let mut unique_tokens_processed = HashSet::new();
                                     for token in &available_tokens_here {
-                                        if unique_tokens_processed.insert(token.to_string()) {
+                                        // Extract the actual value from timed tokens for binding
+                                        let token_value = extract_token_value(token);
+                                        if unique_tokens_processed.insert(token_value.to_string()) {
                                             /*
                                             [DEBUG] Binding variable '{}' to token '{}' from place '{}' for transition '{}'
                                             */
                                             let mut new_binding = current_binding.clone();
-                                            new_binding.variables.insert(var_name.clone(), token.clone());
+                                            // Bind the extracted value, not the whole timed token
+                                            new_binding.variables.insert(var_name.clone(), token_value);
                                             new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
                                             next_bindings_for_arc.push(new_binding);
                                         }
@@ -1233,10 +1514,15 @@ impl Simulator {
                                                                             /*
                                                                             [DEBUG] Available tokens in place '{}': {:?}
                                                                             */
+                                                                            let timestamps_for_place = self.token_timestamps.get(place_id.as_str())
+                                                                                .map(|v| v.as_slice())
+                                                                                .unwrap_or(&[]);
                                                                             let available_here = Self::get_available_token_indices_with_place(
                                                                                 place_id,
                                                                                 tokens_in_place,
+                                                                                timestamps_for_place,
                                                                                 binding.consumed_tokens_map.get(place_id),
+                                                                                self.current_time,
                                                                             );
                                                                             all_available_tokens_info.extend(available_here.into_iter().map(|(_, idx, tok)| (place_id.clone(), idx, tok)));
                                                                         }
@@ -1347,6 +1633,64 @@ impl Simulator {
         &self.current_marking
     }
 
+    /// Get the current simulation time in milliseconds
+    pub fn get_current_time(&self) -> i64 {
+        self.current_time
+    }
+
+    /// Set the current simulation time in milliseconds
+    pub fn set_current_time(&mut self, time: i64) {
+        self.current_time = time;
+    }
+
+    /// Get the simulation epoch (ISO 8601 string)
+    pub fn get_simulation_epoch(&self) -> Option<&String> {
+        self.simulation_epoch.as_ref()
+    }
+
+    /// Set the simulation epoch (ISO 8601 string)
+    pub fn set_simulation_epoch(&mut self, epoch: Option<String>) {
+        self.simulation_epoch = epoch;
+    }
+
+    /// Advance simulation time by a given delta in milliseconds
+    pub fn advance_time(&mut self, delta_ms: i64) {
+        self.current_time += delta_ms;
+    }
+
+    /// Find the earliest timestamp of any token that is in the future (after current_time).
+    /// Returns None if there are no future tokens.
+    fn find_earliest_future_token_time(&self) -> Option<i64> {
+        let mut earliest: Option<i64> = None;
+        
+        for (place_id, tokens) in &self.current_marking {
+            let timestamps = self.token_timestamps.get(place_id);
+            
+            for (index, token) in tokens.iter().enumerate() {
+                // Get timestamp from parallel array or embedded in token
+                let timestamp = if let Some(ts_vec) = timestamps {
+                    if let Some(&ts) = ts_vec.get(index) {
+                        if ts != 0 { ts } else { extract_token_timestamp(token) }
+                    } else {
+                        extract_token_timestamp(token)
+                    }
+                } else {
+                    extract_token_timestamp(token)
+                };
+                
+                // Only consider future tokens
+                if timestamp > self.current_time {
+                    earliest = Some(match earliest {
+                        None => timestamp,
+                        Some(e) => std::cmp::min(e, timestamp),
+                    });
+                }
+            }
+        }
+        
+        earliest
+    }
+
     /// Get the list of currently enabled transitions.
     /// Returns a vector of (transition_id, transition_name) pairs.
     pub fn get_enabled_transitions(&self) -> Vec<(String, String)> {
@@ -1402,11 +1746,16 @@ impl Simulator {
         Simulator {
             model: self.model.clone(),
             current_marking: self.current_marking.clone(),
+            token_timestamps: self.token_timestamps.clone(),
+            current_time: self.current_time,
+            simulation_epoch: self.simulation_epoch.clone(),
+            timed_places: self.timed_places.clone(),
             rhai_engine: Engine::new(), // Fresh engine for checking
             rhai_scope: self.rhai_scope.clone(),
             guards: self.guards.clone(),
             arc_expressions: self.arc_expressions.clone(),
             initial_marking_expressions: self.initial_marking_expressions.clone(),
+            time_expressions: self.time_expressions.clone(),
             declared_variables: self.declared_variables.clone(),
             parsed_color_sets: self.parsed_color_sets.clone(),
         }
@@ -1530,6 +1879,7 @@ impl Simulator {
         Some(FiringEventData {
             transition_id: transition_id.to_string(),
             transition_name: transition_to_fire.name.clone(),
+            simulation_time: self.current_time,
             consumed: consumed_tokens_event,
             produced: produced_tokens_event,
         })

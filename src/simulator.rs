@@ -346,11 +346,13 @@ fn rhai_multiset_equal_wrapper(context: NativeCallContext, a: Dynamic, b: Dynami
 /// The timestamp is in milliseconds relative to the simulation epoch.
 /// A token is "ready" when current_time >= timestamp.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TimedToken {
     pub value: Dynamic,
     pub timestamp: i64, // Availability time in milliseconds (0 = immediately available)
 }
 
+#[allow(dead_code)]
 impl TimedToken {
     pub fn new(value: Dynamic, timestamp: i64) -> Self {
         TimedToken { value, timestamp }

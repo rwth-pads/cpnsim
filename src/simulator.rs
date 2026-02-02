@@ -817,8 +817,8 @@ impl Simulator {
     pub fn run_step(&mut self) -> Option<FiringEventData> {
         let mut enabled_bindings = self.find_enabled_bindings();
         
-        // If no bindings found, check for future tokens and advance time if needed
-        if enabled_bindings.is_empty() {
+        // If no bindings found, keep advancing time until we find enabled transitions or run out of future tokens
+        while enabled_bindings.is_empty() {
             if let Some(earliest_future_time) = self.find_earliest_future_token_time() {
                 // Advance simulation time to when the next token becomes available
                 #[cfg(target_arch = "wasm32")]
@@ -832,6 +832,9 @@ impl Simulator {
                 
                 // Try finding bindings again at the new time
                 enabled_bindings = self.find_enabled_bindings();
+            } else {
+                // No more future tokens, simulation is truly done
+                break;
             }
         }
         

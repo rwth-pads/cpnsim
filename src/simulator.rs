@@ -2,6 +2,7 @@ use crate::model::{PetriNetData, FiringEventData};
 use rhai::{Engine, Scope, Dynamic, AST, Module, EvalAltResult, NativeCallContext};
 use std::collections::{HashMap, HashSet};
 use rand::prelude::*;
+use rand_distr::{Distribution, Bernoulli, Beta, Binomial, ChiSquared, Exp, Gamma, Normal, Poisson, StudentT, Uniform, Weibull};
 
 // Represents a potential binding for a transition
 #[derive(Debug, Clone)]
@@ -442,6 +443,205 @@ fn register_delay_module(engine: &mut Engine) {
     engine.register_fn("delay_days", delay_days);
 }
 
+// ============================================================================
+// Rhai random distribution module - provides CPN Tools compatible distributions
+// See: https://cpntools.org/2018/01/18/random-distribution-functions/
+// ============================================================================
+
+/// Bernoulli distribution: returns 1 with probability p, 0 with probability 1-p
+/// Raises exception if p < 0.0 or p > 1.0
+fn dist_bernoulli(p: f64) -> Result<i64, Box<EvalAltResult>> {
+    if p < 0.0 || p > 1.0 {
+        return Err(format!("Bernoulli: p must be in [0, 1], got {}", p).into());
+    }
+    let dist = Bernoulli::new(p).map_err(|e| format!("Bernoulli error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(if dist.sample(&mut rng) { 1 } else { 0 })
+}
+
+/// Beta distribution with shape parameters a and b
+/// Raises exception if a <= 0.0 or b <= 0.0
+fn dist_beta(a: f64, b: f64) -> Result<f64, Box<EvalAltResult>> {
+    if a <= 0.0 || b <= 0.0 {
+        return Err(format!("Beta: a and b must be > 0, got a={}, b={}", a, b).into());
+    }
+    let dist = Beta::new(a, b).map_err(|e| format!("Beta error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Binomial distribution: number of successes in n trials with probability p
+/// Raises exception if n < 1 or p < 0.0 or p > 1.0
+fn dist_binomial(n: i64, p: f64) -> Result<i64, Box<EvalAltResult>> {
+    if n < 1 {
+        return Err(format!("Binomial: n must be >= 1, got {}", n).into());
+    }
+    if p < 0.0 || p > 1.0 {
+        return Err(format!("Binomial: p must be in [0, 1], got {}", p).into());
+    }
+    let dist = Binomial::new(n as u64, p).map_err(|e| format!("Binomial error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng) as i64)
+}
+
+/// Chi-squared distribution with n degrees of freedom
+/// Raises exception if n < 1
+fn dist_chisq(n: i64) -> Result<f64, Box<EvalAltResult>> {
+    if n < 1 {
+        return Err(format!("Chisq: n must be >= 1, got {}", n).into());
+    }
+    let dist = ChiSquared::new(n as f64).map_err(|e| format!("Chisq error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Discrete uniform distribution: returns integer in [a, b]
+/// Raises exception if a > b
+fn dist_discrete(a: i64, b: i64) -> Result<i64, Box<EvalAltResult>> {
+    if a > b {
+        return Err(format!("Discrete: a must be <= b, got a={}, b={}", a, b).into());
+    }
+    let mut rng = rand::rng();
+    Ok(rng.random_range(a..=b))
+}
+
+/// Erlang distribution with shape n and rate r
+/// This is a Gamma distribution with integer shape parameter
+/// Raises exception if n < 1 or r <= 0.0
+fn dist_erlang(n: i64, r: f64) -> Result<f64, Box<EvalAltResult>> {
+    if n < 1 {
+        return Err(format!("Erlang: n must be >= 1, got {}", n).into());
+    }
+    if r <= 0.0 {
+        return Err(format!("Erlang: r must be > 0, got {}", r).into());
+    }
+    // Erlang(n, r) = Gamma(n, 1/r) where r is the rate
+    let dist = Gamma::new(n as f64, 1.0 / r).map_err(|e| format!("Erlang error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Exponential distribution with rate r (mean = 1/r)
+/// Raises exception if r <= 0.0
+fn dist_exponential(r: f64) -> Result<f64, Box<EvalAltResult>> {
+    if r <= 0.0 {
+        return Err(format!("Exponential: r must be > 0, got {}", r).into());
+    }
+    let dist = Exp::new(r).map_err(|e| format!("Exponential error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Gamma distribution with scale l (lambda) and shape k
+/// Raises exception if l <= 0.0 or k <= 0.0
+fn dist_gamma(l: f64, k: f64) -> Result<f64, Box<EvalAltResult>> {
+    if l <= 0.0 || k <= 0.0 {
+        return Err(format!("Gamma: l and k must be > 0, got l={}, k={}", l, k).into());
+    }
+    // rand_distr::Gamma uses (shape, scale) = (k, l)
+    let dist = Gamma::new(k, l).map_err(|e| format!("Gamma error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Normal (Gaussian) distribution with mean n and variance v
+/// Raises exception if v < 0.0
+fn dist_normal(n: f64, v: f64) -> Result<f64, Box<EvalAltResult>> {
+    if v < 0.0 {
+        return Err(format!("Normal: variance must be >= 0, got {}", v).into());
+    }
+    if v == 0.0 {
+        return Ok(n); // Zero variance means constant value
+    }
+    // Normal::new takes (mean, std_dev), variance = std_dev^2
+    let std_dev = v.sqrt();
+    let dist = Normal::new(n, std_dev).map_err(|e| format!("Normal error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Poisson distribution with mean m
+/// Raises exception if m <= 0.0
+fn dist_poisson(m: f64) -> Result<i64, Box<EvalAltResult>> {
+    if m <= 0.0 {
+        return Err(format!("Poisson: m must be > 0, got {}", m).into());
+    }
+    let dist = Poisson::new(m).map_err(|e| format!("Poisson error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng) as i64)
+}
+
+/// Rayleigh distribution with scale parameter s
+/// Raises exception if s < 0.0
+fn dist_rayleigh(s: f64) -> Result<f64, Box<EvalAltResult>> {
+    if s < 0.0 {
+        return Err(format!("Rayleigh: s must be >= 0, got {}", s).into());
+    }
+    if s == 0.0 {
+        return Ok(0.0); // Zero scale means constant 0
+    }
+    // Rayleigh is a special case of Weibull with shape=2
+    // Or we can use: X = s * sqrt(-2 * ln(U)) where U is uniform(0,1)
+    let mut rng = rand::rng();
+    let u: f64 = rng.random();
+    Ok(s * (-2.0 * u.ln()).sqrt())
+}
+
+/// Student's t-distribution with n degrees of freedom
+/// Raises exception if n < 1
+fn dist_student(n: i64) -> Result<f64, Box<EvalAltResult>> {
+    if n < 1 {
+        return Err(format!("Student: n must be >= 1, got {}", n).into());
+    }
+    let dist = StudentT::new(n as f64).map_err(|e| format!("Student error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Continuous uniform distribution on [a, b]
+/// Raises exception if a > b
+fn dist_uniform(a: f64, b: f64) -> Result<f64, Box<EvalAltResult>> {
+    if a > b {
+        return Err(format!("Uniform: a must be <= b, got a={}, b={}", a, b).into());
+    }
+    if a == b {
+        return Ok(a);
+    }
+    let dist = Uniform::new_inclusive(a, b).map_err(|e| format!("Uniform error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Weibull distribution with scale lambda and shape k
+/// Raises exception if lambda <= 0.0 or k <= 0.0
+fn dist_weibull(lambda: f64, k: f64) -> Result<f64, Box<EvalAltResult>> {
+    if lambda <= 0.0 || k <= 0.0 {
+        return Err(format!("Weibull: lambda and k must be > 0, got lambda={}, k={}", lambda, k).into());
+    }
+    let dist = Weibull::new(lambda, k).map_err(|e| format!("Weibull error: {}", e))?;
+    let mut rng = rand::rng();
+    Ok(dist.sample(&mut rng))
+}
+
+/// Register all random distribution functions with a Rhai engine
+/// Function names match CPN Tools convention
+fn register_distribution_module(engine: &mut Engine) {
+    engine.register_fn("bernoulli", dist_bernoulli);
+    engine.register_fn("beta", dist_beta);
+    engine.register_fn("binomial", dist_binomial);
+    engine.register_fn("chisq", dist_chisq);
+    engine.register_fn("discrete", dist_discrete);
+    engine.register_fn("erlang", dist_erlang);
+    engine.register_fn("exponential", dist_exponential);
+    engine.register_fn("gamma", dist_gamma);
+    engine.register_fn("normal", dist_normal);
+    engine.register_fn("poisson", dist_poisson);
+    engine.register_fn("rayleigh", dist_rayleigh);
+    engine.register_fn("student", dist_student);
+    engine.register_fn("uniform", dist_uniform);
+    engine.register_fn("weibull", dist_weibull);
+}
+
 /// Extract the actual value from a token, handling both timed and non-timed formats.
 /// For timed tokens (Rhai maps with "value" and "timestamp" fields), returns the "value" field.
 /// For non-timed tokens, returns the token as-is.
@@ -488,6 +688,9 @@ impl Simulator {
         
         // Register delay module for timed simulations
         register_delay_module(&mut engine);
+        
+        // Register random distribution functions (CPN Tools compatible)
+        register_distribution_module(&mut engine);
 
         let mut guards = HashMap::new();
         let mut arc_expressions = HashMap::new();

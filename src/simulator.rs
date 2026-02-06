@@ -1,8 +1,20 @@
 use crate::model::{PetriNetData, FiringEventData};
 use rhai::{Engine, Scope, Dynamic, AST, Module, EvalAltResult, NativeCallContext};
 use std::collections::{HashMap, HashSet};
+use std::cell::Cell;
 use rand::prelude::*;
 use rand_distr::{Distribution, Bernoulli, Beta, Binomial, ChiSquared, Exp, Gamma, Normal, Poisson, StudentT, Uniform, Weibull};
+use chrono::{DateTime, Utc, Datelike, Timelike, Duration, Weekday};
+
+// Thread-local storage for simulation time context.
+// Rhai script-defined functions cannot access scope variables, so we use
+// thread-local state that native Rust functions can read directly.
+// This is safe because WASM is single-threaded and native Rust tests are
+// typically single-threaded per test.
+thread_local! {
+    static SIM_CURRENT_TIME: Cell<i64> = Cell::new(0);
+    static SIM_EPOCH_MS: Cell<i64> = Cell::new(0);
+}
 
 // Represents a potential binding for a transition
 #[derive(Debug, Clone)]
@@ -390,6 +402,8 @@ pub struct Simulator {
     current_time: i64,
     // Simulation epoch as ISO 8601 string (for display purposes)
     simulation_epoch: Option<String>,
+    // Simulation epoch as milliseconds since Unix epoch (for calendar calculations)
+    epoch_ms: i64,
     // Map of place_id -> is_timed (whether the place's colorset is timed)
     timed_places: HashMap<String, bool>,
     rhai_engine: Engine,
@@ -441,6 +455,237 @@ fn register_delay_module(engine: &mut Engine) {
     engine.register_fn("delay_min", delay_min);
     engine.register_fn("delay_hours", delay_hours);
     engine.register_fn("delay_days", delay_days);
+}
+
+// ============================================================================
+// Calendar / time utility functions for timed Petri nets
+// These functions convert simulation time (ms since epoch) to calendar units.
+// The Rhai scope provides __sim_time__ (current simulation time in ms since
+// sim start) and __sim_epoch_ms__ (simulation epoch as ms since Unix epoch).
+// Absolute time = __sim_epoch_ms__ + __sim_time__
+// ============================================================================
+
+/// Convert simulation-relative ms to a chrono DateTime<Utc>
+fn sim_time_to_datetime(sim_time_ms: i64, epoch_ms: i64) -> DateTime<Utc> {
+    let abs_ms = epoch_ms + sim_time_ms;
+    DateTime::<Utc>::from_timestamp_millis(abs_ms)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
+}
+
+/// hour_of_day(t) -> 0-23
+fn rhai_hour_of_day(sim_time: i64, epoch_ms: i64) -> i64 {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    dt.hour() as i64
+}
+
+/// minute_of_hour(t) -> 0-59
+fn rhai_minute_of_hour(sim_time: i64, epoch_ms: i64) -> i64 {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    dt.minute() as i64
+}
+
+/// second_of_minute(t) -> 0-59
+fn rhai_second_of_minute(sim_time: i64, epoch_ms: i64) -> i64 {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    dt.second() as i64
+}
+
+/// day_of_week(t) -> 0=Sunday, 1=Monday, ..., 6=Saturday
+fn rhai_day_of_week(sim_time: i64, epoch_ms: i64) -> i64 {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    match dt.weekday() {
+        Weekday::Sun => 0,
+        Weekday::Mon => 1,
+        Weekday::Tue => 2,
+        Weekday::Wed => 3,
+        Weekday::Thu => 4,
+        Weekday::Fri => 5,
+        Weekday::Sat => 6,
+    }
+}
+
+/// day_of_month(t) -> 1-31
+fn rhai_day_of_month(sim_time: i64, epoch_ms: i64) -> i64 {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    dt.day() as i64
+}
+
+/// month(t) -> 1-12
+fn rhai_month(sim_time: i64, epoch_ms: i64) -> i64 {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    dt.month() as i64
+}
+
+/// year(t) -> e.g. 2026
+fn rhai_year(sim_time: i64, epoch_ms: i64) -> i64 {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    dt.year() as i64
+}
+
+/// is_weekend(t) -> true if Saturday or Sunday
+fn rhai_is_weekend(sim_time: i64, epoch_ms: i64) -> bool {
+    let dt = sim_time_to_datetime(sim_time, epoch_ms);
+    matches!(dt.weekday(), Weekday::Sat | Weekday::Sun)
+}
+
+/// is_workday(t) -> true if Monday through Friday
+fn rhai_is_workday(sim_time: i64, epoch_ms: i64) -> bool {
+    !rhai_is_weekend(sim_time, epoch_ms)
+}
+
+/// next_weekday_at(dow, h, m) -> absolute sim time (ms) of the next occurrence
+/// dow: 0=Sunday, 1=Monday, ..., 6=Saturday
+/// h: hour (0-23), m: minute (0-59)
+/// If the current time is before the target time on the same weekday, returns today.
+/// Otherwise returns next week's occurrence.
+fn rhai_next_weekday_at(sim_time: i64, epoch_ms: i64, dow: i64, h: i64, m: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+    let _target_weekday = match dow {
+        0 => Weekday::Sun,
+        1 => Weekday::Mon,
+        2 => Weekday::Tue,
+        3 => Weekday::Wed,
+        4 => Weekday::Thu,
+        5 => Weekday::Fri,
+        6 => Weekday::Sat,
+        _ => Weekday::Mon, // default
+    };
+    
+    // Calculate days until target weekday
+    let current_dow = now.weekday().num_days_from_sunday() as i64;
+    let target_dow = dow;
+    let mut days_ahead = target_dow - current_dow;
+    if days_ahead < 0 {
+        days_ahead += 7;
+    }
+    
+    // Build candidate datetime
+    let candidate = now.date_naive() + Duration::days(days_ahead);
+    let candidate_dt = candidate.and_hms_opt(h as u32, m as u32, 0)
+        .unwrap_or(candidate.and_hms_opt(0, 0, 0).unwrap());
+    let candidate_utc = DateTime::<Utc>::from_naive_utc_and_offset(candidate_dt, Utc);
+    
+    // If candidate is in the past or at current time, go to next week
+    let result = if candidate_utc.timestamp_millis() <= now.timestamp_millis() {
+        let next_week = candidate + Duration::days(7);
+        let next_dt = next_week.and_hms_opt(h as u32, m as u32, 0)
+            .unwrap_or(next_week.and_hms_opt(0, 0, 0).unwrap());
+        DateTime::<Utc>::from_naive_utc_and_offset(next_dt, Utc)
+    } else {
+        candidate_utc
+    };
+    
+    // Return as simulation-relative time
+    result.timestamp_millis() - epoch_ms
+}
+
+/// next_weekday(dow) -> next occurrence at midnight
+fn rhai_next_weekday(sim_time: i64, epoch_ms: i64, dow: i64) -> i64 {
+    rhai_next_weekday_at(sim_time, epoch_ms, dow, 0, 0)
+}
+
+/// next_hour(h) -> sim time (ms) of the next occurrence of hour h:00
+fn rhai_next_hour(sim_time: i64, epoch_ms: i64, h: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+    let today = now.date_naive();
+    let candidate = today.and_hms_opt(h as u32, 0, 0)
+        .unwrap_or(today.and_hms_opt(0, 0, 0).unwrap());
+    let candidate_utc = DateTime::<Utc>::from_naive_utc_and_offset(candidate, Utc);
+    
+    let result = if candidate_utc.timestamp_millis() <= now.timestamp_millis() {
+        // Already past this hour today, use tomorrow
+        let tomorrow = today + Duration::days(1);
+        let dt = tomorrow.and_hms_opt(h as u32, 0, 0)
+            .unwrap_or(tomorrow.and_hms_opt(0, 0, 0).unwrap());
+        DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc)
+    } else {
+        candidate_utc
+    };
+    
+    result.timestamp_millis() - epoch_ms
+}
+
+/// Register calendar functions with Rhai engine.
+/// All user-facing functions are registered as native Rust functions that read
+/// current simulation time and epoch from thread-local storage (SIM_CURRENT_TIME
+/// and SIM_EPOCH_MS). This avoids the Rhai limitation where script-defined
+/// functions cannot access scope variables.
+fn register_calendar_module(engine: &mut Engine) {
+    // Helper to get current sim time and epoch from thread-local
+    fn get_sim_ctx() -> (i64, i64) {
+        let t = SIM_CURRENT_TIME.with(|c| c.get());
+        let e = SIM_EPOCH_MS.with(|c| c.get());
+        (t, e)
+    }
+
+    // current_time() -> current simulation time in ms
+    engine.register_fn("current_time", || -> i64 {
+        SIM_CURRENT_TIME.with(|c| c.get())
+    });
+
+    // Calendar decomposition: take a sim_time parameter
+    engine.register_fn("hour_of_day", |t: i64| -> i64 {
+        let (_, e) = get_sim_ctx(); rhai_hour_of_day(t, e)
+    });
+    engine.register_fn("minute_of_hour", |t: i64| -> i64 {
+        let (_, e) = get_sim_ctx(); rhai_minute_of_hour(t, e)
+    });
+    engine.register_fn("second_of_minute", |t: i64| -> i64 {
+        let (_, e) = get_sim_ctx(); rhai_second_of_minute(t, e)
+    });
+    engine.register_fn("day_of_week", |t: i64| -> i64 {
+        let (_, e) = get_sim_ctx(); rhai_day_of_week(t, e)
+    });
+    engine.register_fn("day_of_month", |t: i64| -> i64 {
+        let (_, e) = get_sim_ctx(); rhai_day_of_month(t, e)
+    });
+    engine.register_fn("month", |t: i64| -> i64 {
+        let (_, e) = get_sim_ctx(); rhai_month(t, e)
+    });
+    engine.register_fn("year", |t: i64| -> i64 {
+        let (_, e) = get_sim_ctx(); rhai_year(t, e)
+    });
+    engine.register_fn("is_weekend", |t: i64| -> bool {
+        let (_, e) = get_sim_ctx(); rhai_is_weekend(t, e)
+    });
+    engine.register_fn("is_workday", |t: i64| -> bool {
+        let (_, e) = get_sim_ctx(); rhai_is_workday(t, e)
+    });
+
+    // Scheduling: next_weekday_at(dow, h, m), etc. - use current sim time implicitly
+    engine.register_fn("next_weekday_at", |dow: i64, h: i64, m: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, dow, h, m)
+    });
+    engine.register_fn("next_weekday", |dow: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, dow)
+    });
+    engine.register_fn("next_hour", |h: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_hour(t, e, h)
+    });
+
+    // Convenience: next_monday() .. next_sunday()
+    engine.register_fn("next_monday", || -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, 1) });
+    engine.register_fn("next_tuesday", || -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, 2) });
+    engine.register_fn("next_wednesday", || -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, 3) });
+    engine.register_fn("next_thursday", || -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, 4) });
+    engine.register_fn("next_friday", || -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, 5) });
+    engine.register_fn("next_saturday", || -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, 6) });
+    engine.register_fn("next_sunday", || -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday(t, e, 0) });
+
+    // Convenience: next_monday_at(h, m) .. next_sunday_at(h, m)
+    engine.register_fn("next_monday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 1, h, m) });
+    engine.register_fn("next_tuesday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 2, h, m) });
+    engine.register_fn("next_wednesday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 3, h, m) });
+    engine.register_fn("next_thursday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 4, h, m) });
+    engine.register_fn("next_friday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 5, h, m) });
+    engine.register_fn("next_saturday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 6, h, m) });
+    engine.register_fn("next_sunday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 0, h, m) });
+
+    // time_until(target_time) -> ms until target_time from current sim time
+    engine.register_fn("time_until", |target: i64| -> i64 {
+        let t = SIM_CURRENT_TIME.with(|c| c.get());
+        target - t
+    });
 }
 
 // ============================================================================
@@ -680,6 +925,15 @@ fn create_timed_token(value: Dynamic, timestamp: i64) -> Dynamic {
 }
 
 impl Simulator {
+    /// Update simulation time context for Rhai expression evaluation.
+    /// Sets both thread-local state (for native calendar functions) and
+    /// scope variable (for direct access in expressions).
+    /// Must be called before any guard/arc/time expression evaluation.
+    fn update_scope_time(&mut self) {
+        SIM_CURRENT_TIME.with(|c| c.set(self.current_time));
+        SIM_EPOCH_MS.with(|c| c.set(self.epoch_ms));
+    }
+
     pub fn new(model_data: PetriNetData) -> Result<Self, String> {
         let mut engine = Engine::new();
         let mut scope = Scope::new();
@@ -880,6 +1134,10 @@ impl Simulator {
             }
         }
 
+        // Register calendar functions as native Rust functions.
+        // These read sim time/epoch from thread-local state (set by update_scope_time).
+        register_calendar_module(&mut engine);
+
         for net in &model_data.petri_nets {
             for place in &net.places {
                 if !place.initial_marking.is_empty() && place.initial_marking != "[]" {
@@ -1000,6 +1258,32 @@ impl Simulator {
 
         // Get simulation epoch from model
         let simulation_epoch = model_data.simulation_epoch.clone();
+        
+        // Parse epoch string to milliseconds since Unix epoch
+        // Supports both RFC 3339 ("2026-02-05T23:55:47.356Z") and
+        // naive ISO 8601 without timezone ("2026-02-05T23:55:47.356"), treated as UTC
+        let epoch_ms: i64 = simulation_epoch.as_ref()
+            .and_then(|s| {
+                // First try RFC 3339 (with timezone)
+                DateTime::parse_from_rfc3339(s).ok()
+                    .map(|dt| dt.timestamp_millis())
+                    .or_else(|| {
+                        // Try appending Z for naive ISO 8601 strings
+                        let with_z = format!("{}Z", s);
+                        DateTime::parse_from_rfc3339(&with_z).ok()
+                            .map(|dt| dt.timestamp_millis())
+                    })
+                    .or_else(|| {
+                        // Try parsing as NaiveDateTime directly
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+                            .map(|ndt| ndt.and_utc().timestamp_millis())
+                    })
+            })
+            .unwrap_or(0);
+        
+        // Initialize thread-local simulation context for calendar functions
+        SIM_CURRENT_TIME.with(|c| c.set(0));
+        SIM_EPOCH_MS.with(|c| c.set(epoch_ms));
 
         Ok(Simulator {
             model: model_data,
@@ -1007,6 +1291,7 @@ impl Simulator {
             token_timestamps,
             current_time: 0,
             simulation_epoch,
+            epoch_ms,
             timed_places,
             rhai_engine: engine,
             rhai_scope: scope,
@@ -1371,6 +1656,9 @@ impl Simulator {
     }
 
     fn find_enabled_bindings(&mut self) -> Vec<(String, Binding)> {
+        // Update simulation time in Rhai scope for calendar functions
+        self.update_scope_time();
+        
         let mut final_enabled_bindings = Vec::new();
         if let Some(net) = self.model.petri_nets.first() {
             for transition in &net.transitions {
@@ -1525,10 +1813,12 @@ impl Simulator {
                                                         // This is a product inscription - try to bind from product tokens
                                                         let mut unique_tokens_processed = HashSet::new();
                                                         for token in &available_tokens_here {
-                                                            let token_str = token.to_string();
+                                                            // Extract the actual value from timed tokens (unwrap {value, timestamp} maps)
+                                                            let token_value = extract_token_value(token);
+                                                            let token_str = token_value.to_string();
                                                             if unique_tokens_processed.insert(token_str) {
-                                                                // Try to extract product components
-                                                                if let Some(components) = extract_product_components(token) {
+                                                                // Try to extract product components from the unwrapped value
+                                                                if let Some(components) = extract_product_components(&token_value) {
                                                                     if components.len() == var_names.len() {
                                                                         // Check if bound variables match, and bind unbound ones
                                                                         let mut new_binding = current_binding.clone();
@@ -1957,6 +2247,7 @@ impl Simulator {
             token_timestamps: self.token_timestamps.clone(),
             current_time: self.current_time,
             simulation_epoch: self.simulation_epoch.clone(),
+            epoch_ms: self.epoch_ms,
             timed_places: self.timed_places.clone(),
             rhai_engine: Engine::new(), // Fresh engine for checking
             rhai_scope: self.rhai_scope.clone(),
@@ -1971,6 +2262,9 @@ impl Simulator {
 
     /// Internal method to fire a transition with a specific binding
     fn fire_transition_with_binding(&mut self, transition_id: &str, selected_binding: Binding) -> Option<FiringEventData> {
+        // Update simulation time in Rhai scope for calendar functions in time/arc expressions
+        self.update_scope_time();
+        
         let transition_to_fire = self.model.find_transition(transition_id)?;
         
         let mut consumed_tokens_event: HashMap<String, Vec<Dynamic>> = HashMap::new();
@@ -2045,6 +2339,32 @@ impl Simulator {
             }
         }
 
+        // Evaluate transition time expression to get delay for produced tokens
+        let time_delay: i64 = if let Some(time_ast) = self.time_expressions.get(transition_id) {
+            match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, time_ast) {
+                Ok(result) => {
+                    let delay = result.as_int().unwrap_or(0);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        web_sys::console::log_1(&format!(
+                            "[WASM] fire_transition_with_binding: Transition {} time delay: {} ms",
+                            transition_to_fire.name, delay
+                        ).into());
+                    }
+                    delay
+                }
+                Err(e) => {
+                    eprintln!("Error evaluating time expression for transition {}: {}", transition_to_fire.name, e);
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        // Calculate the timestamp for produced tokens (current_time + time_delay)
+        let produced_token_time = self.current_time + time_delay;
+
         // Produce tokens on output arcs
         if let Some(net) = self.model.petri_nets.first() {
             let output_arcs: Vec<_> = net.arcs.iter().filter(|a| {
@@ -2061,20 +2381,55 @@ impl Simulator {
 
                 if let Some(ast) = self.arc_expressions.get(&arc.id) {
                     match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
-                        Ok(result) => {
-                            let tokens_to_produce = if result.is_array() {
-                                result.into_array().unwrap_or_default()
+                        Ok(produced_tokens_dynamic) => {
+                            let is_product_place = self.is_place_product_type(target_place_id);
+
+                            let tokens_to_add = if is_product_place {
+                                if let Ok(arr) = produced_tokens_dynamic.clone().into_typed_array::<Dynamic>() {
+                                    if !arr.is_empty() {
+                                        if arr[0].clone().into_typed_array::<Dynamic>().is_ok() {
+                                            arr
+                                        } else {
+                                            vec![produced_tokens_dynamic]
+                                        }
+                                    } else {
+                                        vec![]
+                                    }
+                                } else if produced_tokens_dynamic.is_unit() {
+                                    vec![produced_tokens_dynamic]
+                                } else {
+                                    vec![produced_tokens_dynamic]
+                                }
                             } else {
-                                vec![result]
+                                Self::dynamic_to_vec_dynamic(produced_tokens_dynamic)
                             };
 
-                            let place_tokens = self.current_marking.entry(target_place_id.clone()).or_default();
-                            for token in &tokens_to_produce {
-                                place_tokens.push(token.clone());
+                            if !tokens_to_add.is_empty() {
+                                let is_timed = self.timed_places.get(target_place_id).copied().unwrap_or(false);
+
+                                let tokens_for_marking: Vec<Dynamic> = if is_timed {
+                                    tokens_to_add.iter().map(|t| {
+                                        if t.is_map() {
+                                            if let Some(map) = t.read_lock::<rhai::Map>() {
+                                                if map.contains_key("value") && map.contains_key("timestamp") {
+                                                    return t.clone();
+                                                }
+                                            }
+                                        }
+                                        create_timed_token(t.clone(), produced_token_time)
+                                    }).collect()
+                                } else {
+                                    tokens_to_add.clone()
+                                };
+
+                                produced_tokens_event.entry(target_place_id.clone()).or_default().extend(tokens_for_marking.clone());
+                                self.current_marking.entry(target_place_id.clone()).or_default().extend(tokens_for_marking.clone());
+
+                                let timestamps = self.token_timestamps.entry(target_place_id.clone()).or_default();
+                                for _ in 0..tokens_to_add.len() {
+                                    timestamps.push(produced_token_time);
+                                }
                             }
-                            produced_tokens_event.entry(target_place_id.clone())
-                                .or_default()
-                                .extend(tokens_to_produce);
                         }
                         Err(e) => {
                             eprintln!("Error evaluating output arc {}: {}", arc.id, e);

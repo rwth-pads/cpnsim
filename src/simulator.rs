@@ -605,6 +605,200 @@ fn rhai_next_hour(sim_time: i64, epoch_ms: i64, h: i64) -> i64 {
     result.timestamp_millis() - epoch_ms
 }
 
+// ============================================================================
+// High-level scheduling functions
+// These provide a more natural, readable API for scheduling time expressions.
+// They are designed to compose: e.g.
+//   time_until(earliest(next_workday_between(at(9,0), at(12,0)),
+//                       next_workday_between(at(13,0), at(17,0))))
+// ============================================================================
+
+/// at(h, m) -> milliseconds from midnight representing a time-of-day.
+/// Used as input for next_*_between functions.
+fn time_of_day_ms(h: i64, m: i64, s: i64) -> i64 {
+    (h * 3600 + m * 60 + s) * 1000
+}
+
+/// next_day_at(h, m) -> sim time (ms) of the next occurrence of h:m on any day.
+/// If the current time is before h:m today, returns today at h:m.
+/// Otherwise returns tomorrow at h:m.
+fn rhai_next_day_at(sim_time: i64, epoch_ms: i64, h: i64, m: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+    let today = now.date_naive();
+    let candidate = today.and_hms_opt(h as u32, m as u32, 0)
+        .unwrap_or(today.and_hms_opt(0, 0, 0).unwrap());
+    let candidate_utc = DateTime::<Utc>::from_naive_utc_and_offset(candidate, Utc);
+
+    let result = if candidate_utc.timestamp_millis() <= now.timestamp_millis() {
+        let tomorrow = today + Duration::days(1);
+        let dt = tomorrow.and_hms_opt(h as u32, m as u32, 0)
+            .unwrap_or(tomorrow.and_hms_opt(0, 0, 0).unwrap());
+        DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc)
+    } else {
+        candidate_utc
+    };
+
+    result.timestamp_millis() - epoch_ms
+}
+
+/// next_workday_at(h, m) -> sim time (ms) of the next Mon-Fri occurrence at h:m.
+/// If today is a workday and we haven't passed h:m yet, returns today.
+/// Otherwise scans forward day-by-day until a workday is found.
+fn rhai_next_workday_at(sim_time: i64, epoch_ms: i64, h: i64, m: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+
+    for days_ahead in 0..=7 {
+        let day = now.date_naive() + Duration::days(days_ahead);
+        let dt = day.and_hms_opt(h as u32, m as u32, 0)
+            .unwrap_or(day.and_hms_opt(0, 0, 0).unwrap());
+        let dt_utc = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+
+        // Must be in the future
+        if dt_utc.timestamp_millis() <= now.timestamp_millis() {
+            continue;
+        }
+        // Must be a workday (Mon-Fri)
+        let wd = dt_utc.weekday();
+        if matches!(wd, Weekday::Sat | Weekday::Sun) {
+            continue;
+        }
+        return dt_utc.timestamp_millis() - epoch_ms;
+    }
+    // Fallback (should not happen with 0..=7 range)
+    sim_time
+}
+
+/// next_weekend_at(h, m) -> sim time (ms) of the next Sat/Sun occurrence at h:m.
+fn rhai_next_weekend_at(sim_time: i64, epoch_ms: i64, h: i64, m: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+
+    for days_ahead in 0..=7 {
+        let day = now.date_naive() + Duration::days(days_ahead);
+        let dt = day.and_hms_opt(h as u32, m as u32, 0)
+            .unwrap_or(day.and_hms_opt(0, 0, 0).unwrap());
+        let dt_utc = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+
+        if dt_utc.timestamp_millis() <= now.timestamp_millis() {
+            continue;
+        }
+        let wd = dt_utc.weekday();
+        if !matches!(wd, Weekday::Sat | Weekday::Sun) {
+            continue;
+        }
+        return dt_utc.timestamp_millis() - epoch_ms;
+    }
+    sim_time
+}
+
+/// next_workday_between(from_ms, to_ms) -> sim time (ms) of the next moment
+/// that falls on a workday (Mon-Fri) within the daily time window [from, to).
+/// `from_ms` and `to_ms` are ms-from-midnight (as produced by `at(h,m)`).
+/// If the current time is within the window on a workday, returns current time.
+/// Otherwise finds the next workday and returns `from_ms` on that day.
+fn rhai_next_workday_between(sim_time: i64, epoch_ms: i64, from_ms: i64, to_ms: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+    let from_h = (from_ms / 3_600_000) as u32;
+    let from_m = ((from_ms % 3_600_000) / 60_000) as u32;
+    let from_s = ((from_ms % 60_000) / 1000) as u32;
+    let to_h = (to_ms / 3_600_000) as u32;
+    let to_m = ((to_ms % 3_600_000) / 60_000) as u32;
+    let to_s = ((to_ms % 60_000) / 1000) as u32;
+
+    for days_ahead in 0..=7 {
+        let day = now.date_naive() + Duration::days(days_ahead);
+        let wd = day.weekday();
+        // Skip weekends
+        if matches!(wd, Weekday::Sat | Weekday::Sun) {
+            continue;
+        }
+
+        let window_start = day.and_hms_opt(from_h, from_m, from_s)
+            .unwrap_or(day.and_hms_opt(0, 0, 0).unwrap());
+        let window_end = day.and_hms_opt(to_h, to_m, to_s)
+            .unwrap_or(day.and_hms_opt(23, 59, 59).unwrap());
+        let start_utc = DateTime::<Utc>::from_naive_utc_and_offset(window_start, Utc);
+        let end_utc = DateTime::<Utc>::from_naive_utc_and_offset(window_end, Utc);
+
+        // If we're currently inside the window, return current time
+        if now >= start_utc && now < end_utc {
+            return sim_time;
+        }
+        // If the window hasn't started yet today (or on a future day), return window start
+        if start_utc.timestamp_millis() > now.timestamp_millis() {
+            return start_utc.timestamp_millis() - epoch_ms;
+        }
+        // Otherwise the window has already passed today; try next day
+    }
+    sim_time
+}
+
+/// next_day_between(from_ms, to_ms) -> sim time (ms) of the next moment
+/// within the daily time window [from, to) on any day.
+fn rhai_next_day_between(sim_time: i64, epoch_ms: i64, from_ms: i64, to_ms: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+    let from_h = (from_ms / 3_600_000) as u32;
+    let from_m = ((from_ms % 3_600_000) / 60_000) as u32;
+    let from_s = ((from_ms % 60_000) / 1000) as u32;
+    let to_h = (to_ms / 3_600_000) as u32;
+    let to_m = ((to_ms % 3_600_000) / 60_000) as u32;
+    let to_s = ((to_ms % 60_000) / 1000) as u32;
+
+    for days_ahead in 0..=1 {
+        let day = now.date_naive() + Duration::days(days_ahead);
+
+        let window_start = day.and_hms_opt(from_h, from_m, from_s)
+            .unwrap_or(day.and_hms_opt(0, 0, 0).unwrap());
+        let window_end = day.and_hms_opt(to_h, to_m, to_s)
+            .unwrap_or(day.and_hms_opt(23, 59, 59).unwrap());
+        let start_utc = DateTime::<Utc>::from_naive_utc_and_offset(window_start, Utc);
+        let end_utc = DateTime::<Utc>::from_naive_utc_and_offset(window_end, Utc);
+
+        if now >= start_utc && now < end_utc {
+            return sim_time;
+        }
+        if start_utc.timestamp_millis() > now.timestamp_millis() {
+            return start_utc.timestamp_millis() - epoch_ms;
+        }
+    }
+    sim_time
+}
+
+/// next_weekend_between(from_ms, to_ms) -> sim time (ms) of the next moment
+/// on a weekend day (Sat/Sun) within the daily time window [from, to).
+fn rhai_next_weekend_between(sim_time: i64, epoch_ms: i64, from_ms: i64, to_ms: i64) -> i64 {
+    let now = sim_time_to_datetime(sim_time, epoch_ms);
+    let from_h = (from_ms / 3_600_000) as u32;
+    let from_m = ((from_ms % 3_600_000) / 60_000) as u32;
+    let from_s = ((from_ms % 60_000) / 1000) as u32;
+    let to_h = (to_ms / 3_600_000) as u32;
+    let to_m = ((to_ms % 3_600_000) / 60_000) as u32;
+    let to_s = ((to_ms % 60_000) / 1000) as u32;
+
+    for days_ahead in 0..=7 {
+        let day = now.date_naive() + Duration::days(days_ahead);
+        let wd = day.weekday();
+        // Skip workdays
+        if !matches!(wd, Weekday::Sat | Weekday::Sun) {
+            continue;
+        }
+
+        let window_start = day.and_hms_opt(from_h, from_m, from_s)
+            .unwrap_or(day.and_hms_opt(0, 0, 0).unwrap());
+        let window_end = day.and_hms_opt(to_h, to_m, to_s)
+            .unwrap_or(day.and_hms_opt(23, 59, 59).unwrap());
+        let start_utc = DateTime::<Utc>::from_naive_utc_and_offset(window_start, Utc);
+        let end_utc = DateTime::<Utc>::from_naive_utc_and_offset(window_end, Utc);
+
+        if now >= start_utc && now < end_utc {
+            return sim_time;
+        }
+        if start_utc.timestamp_millis() > now.timestamp_millis() {
+            return start_utc.timestamp_millis() - epoch_ms;
+        }
+    }
+    sim_time
+}
+
 /// Register calendar functions with Rhai engine.
 /// All user-facing functions are registered as native Rust functions that read
 /// current simulation time and epoch from thread-local storage (SIM_CURRENT_TIME
@@ -680,6 +874,90 @@ fn register_calendar_module(engine: &mut Engine) {
     engine.register_fn("next_friday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 5, h, m) });
     engine.register_fn("next_saturday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 6, h, m) });
     engine.register_fn("next_sunday_at", |h: i64, m: i64| -> i64 { let (t, e) = get_sim_ctx(); rhai_next_weekday_at(t, e, 0, h, m) });
+
+    // ========================================================================
+    // High-level scheduling API
+    // ========================================================================
+
+    // at(h) -> ms-from-midnight (shorthand for at(h, 0))
+    engine.register_fn("at", |h: i64| -> i64 {
+        time_of_day_ms(h, 0, 0)
+    });
+    // at(h, m) -> ms-from-midnight time-of-day value (for use with *_between)
+    engine.register_fn("at", |h: i64, m: i64| -> i64 {
+        time_of_day_ms(h, m, 0)
+    });
+    // at(h, m, s) -> ms-from-midnight with seconds
+    engine.register_fn("at", |h: i64, m: i64, s: i64| -> i64 {
+        time_of_day_ms(h, m, s)
+    });
+
+    // next_day_at(h, m) -> next occurrence of h:m on any day
+    engine.register_fn("next_day_at", |h: i64, m: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_day_at(t, e, h, m)
+    });
+
+    // next_workday_at(h, m) -> next Mon-Fri at h:m
+    engine.register_fn("next_workday_at", |h: i64, m: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_workday_at(t, e, h, m)
+    });
+
+    // next_weekend_at(h, m) -> next Sat/Sun at h:m
+    engine.register_fn("next_weekend_at", |h: i64, m: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_weekend_at(t, e, h, m)
+    });
+
+    // next_workday_between(from, to) -> next Mon-Fri moment in [from, to) window
+    // from/to are ms-from-midnight as produced by at(h, m)
+    engine.register_fn("next_workday_between", |from: i64, to: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_workday_between(t, e, from, to)
+    });
+
+    // next_day_between(from, to) -> next moment in [from, to) window on any day
+    engine.register_fn("next_day_between", |from: i64, to: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_day_between(t, e, from, to)
+    });
+
+    // next_weekend_between(from, to) -> next Sat/Sun moment in [from, to) window
+    engine.register_fn("next_weekend_between", |from: i64, to: i64| -> i64 {
+        let (t, e) = get_sim_ctx(); rhai_next_weekend_between(t, e, from, to)
+    });
+
+    // earliest(t1, t2) -> minimum of two timestamps
+    engine.register_fn("earliest", |a: i64, b: i64| -> i64 {
+        a.min(b)
+    });
+    // earliest(t1, t2, t3) -> minimum of three timestamps
+    engine.register_fn("earliest", |a: i64, b: i64, c: i64| -> i64 {
+        a.min(b).min(c)
+    });
+    // earliest(t1, t2, t3, t4) -> minimum of four timestamps
+    engine.register_fn("earliest", |a: i64, b: i64, c: i64, d: i64| -> i64 {
+        a.min(b).min(c).min(d)
+    });
+    // earliest(array) -> minimum of an array of timestamps
+    engine.register_fn("earliest", |arr: rhai::Array| -> i64 {
+        arr.iter()
+            .filter_map(|v| v.as_int().ok())
+            .min()
+            .unwrap_or(i64::MAX)
+    });
+
+    // latest(t1, t2) -> maximum of two timestamps
+    engine.register_fn("latest", |a: i64, b: i64| -> i64 {
+        a.max(b)
+    });
+    // latest(t1, t2, t3) -> maximum of three timestamps
+    engine.register_fn("latest", |a: i64, b: i64, c: i64| -> i64 {
+        a.max(b).max(c)
+    });
+    // latest(array) -> maximum of an array of timestamps
+    engine.register_fn("latest", |arr: rhai::Array| -> i64 {
+        arr.iter()
+            .filter_map(|v| v.as_int().ok())
+            .max()
+            .unwrap_or(0)
+    });
 
     // time_until(target_time) -> ms until target_time from current sim time
     engine.register_fn("time_until", |target: i64| -> i64 {

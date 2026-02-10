@@ -1686,7 +1686,8 @@ impl Simulator {
                 let is_output_arc = arc.source == selected_transition_id || 
                     (arc.is_bidirectional && arc.target == selected_transition_id);
                 
-                if is_output_arc {
+                // Skip inhibitor/reset arcs — they don't produce tokens
+                if is_output_arc && !arc.is_inhibitor() && !arc.is_reset() {
                     // Find unbound variables used in output arcs that have int range colorsets
                     for (var_name, colorset_name) in &self.declared_variables {
                         // Skip if already bound from input arcs
@@ -1755,7 +1756,8 @@ impl Simulator {
                 let is_output_arc = arc.source == selected_transition_id || 
                     (arc.is_bidirectional && arc.target == selected_transition_id);
                 
-                if is_output_arc {
+                // Skip inhibitor/reset arcs — they don't produce tokens
+                if is_output_arc && !arc.is_inhibitor() && !arc.is_reset() {
                     // For bidirectional arcs where target is the transition, the place is the source
                     let place_id = if arc.is_bidirectional && arc.target == selected_transition_id {
                         &arc.source
@@ -1957,6 +1959,63 @@ impl Simulator {
                     let inscription = &arc.inscription;
                     let mut next_bindings_for_arc = Vec::new();
 
+                    // --- Handle Inhibitor Arcs ---
+                    // Inhibitor arc: transition enabled only when place is empty
+                    if arc.is_inhibitor() {
+                        let tokens_in_place = self.current_marking.get(place_id)
+                            .map(|t| t.len())
+                            .unwrap_or(0);
+                        if tokens_in_place == 0 {
+                            // Place is empty — inhibitor condition satisfied, pass through all bindings
+                            for current_binding in &potential_bindings {
+                                next_bindings_for_arc.push(current_binding.clone());
+                            }
+                        }
+                        // else: place has tokens — inhibitor blocks, next_bindings stays empty
+                        potential_bindings = next_bindings_for_arc;
+                        if potential_bindings.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // --- Handle Reset Arcs ---
+                    // Reset arc: when transition fires, all tokens are removed from the place
+                    // For enabling: place just needs to exist (reset arcs don't constrain enabling)
+                    // We mark all tokens for consumption during firing
+                    if arc.is_reset() {
+                        for current_binding in &potential_bindings {
+                            let mut new_binding = current_binding.clone();
+                            // Mark all current tokens in this place for consumption
+                            if let Some(tokens) = self.current_marking.get(place_id) {
+                                let timestamps = self.token_timestamps.get(place_id.as_str())
+                                    .map(|v| v.as_slice())
+                                    .unwrap_or(&[]);
+                                let current_time = self.current_time;
+                                // Only consume tokens that are currently available (respecting timestamps)
+                                for (index, token) in tokens.iter().enumerate() {
+                                    let timestamp = if let Some(&ts) = timestamps.get(index) {
+                                        if ts != 0 { ts } else { extract_token_timestamp(token) }
+                                    } else {
+                                        extract_token_timestamp(token)
+                                    };
+                                    if timestamp <= current_time {
+                                        new_binding.consumed_tokens_map
+                                            .entry(place_id.clone())
+                                            .or_default()
+                                            .push(token.clone());
+                                    }
+                                }
+                            }
+                            next_bindings_for_arc.push(new_binding);
+                        }
+                        potential_bindings = next_bindings_for_arc;
+                        if potential_bindings.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+
                     let all_tokens_in_place = match self.current_marking.get(place_id) {
                         Some(tokens) => tokens,
                         None => {
@@ -2126,6 +2185,81 @@ impl Simulator {
                                                         }
                                                         // Continue to next binding even if no matches found (it will be filtered out naturally)
                                                         continue;
+                                                    } else if !self.is_place_product_type(place_id) && var_names.iter().all(|v| self.declared_variables.contains_key(v)) {
+                                                        // Multiset inscription on a non-product place: [var1, var2, ...]
+                                                        // Each variable binds independently to a separate token from this place.
+                                                        let place_colorset = self.get_place_colorset(place_id);
+
+                                                        // Check all vars have colorset matching this place
+                                                        let all_match_place = var_names.iter().all(|v| {
+                                                            let var_cs = self.declared_variables.get(v);
+                                                            var_cs == place_colorset.as_ref()
+                                                        });
+
+                                                        if all_match_place {
+                                                            // Generate all permutations of token assignments to variables.
+                                                            // Start with a partial assignment, then extend one variable at a time.
+                                                            let mut partial_assignments: Vec<(HashMap<String, Dynamic>, Vec<Dynamic>)> = vec![(HashMap::new(), Vec::new())];
+
+                                                            for var_name in &var_names {
+                                                                let mut next_partial = Vec::new();
+                                                                for (assigned, consumed) in &partial_assignments {
+                                                                    // Check if already bound in current_binding
+                                                                    if let Some(existing_val) = current_binding.variables.get(var_name).or_else(|| assigned.get(var_name)) {
+                                                                        // Variable already bound — find a matching available token not yet consumed
+                                                                        let existing_str = existing_val.to_string();
+                                                                        for token in &available_tokens_here {
+                                                                            let token_value = extract_token_value(token);
+                                                                            if token_value.to_string() == existing_str {
+                                                                                // Check this token isn't already consumed in this partial assignment
+                                                                                let already_consumed_count = consumed.iter().filter(|c| c.to_string() == token.to_string()).count();
+                                                                                let total_available = available_tokens_here.iter().filter(|t| t.to_string() == token.to_string()).count();
+                                                                                if already_consumed_count < total_available {
+                                                                                    let new_assigned = assigned.clone();
+                                                                                    let mut new_consumed = consumed.clone();
+                                                                                    new_consumed.push(token.clone());
+                                                                                    next_partial.push((new_assigned, new_consumed));
+                                                                                    break;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        // If not found, this partial is dead
+                                                                    } else {
+                                                                        // Variable not yet bound — try each unique available token
+                                                                        let mut tried = HashSet::new();
+                                                                        for token in &available_tokens_here {
+                                                                            let token_value = extract_token_value(token);
+                                                                            let token_str = token_value.to_string();
+                                                                            if !tried.insert(token_str.clone()) {
+                                                                                continue;
+                                                                            }
+                                                                            // Check availability: count consumed vs available
+                                                                            let consumed_count = consumed.iter().filter(|c| c.to_string() == token.to_string()).count();
+                                                                            let total_available = available_tokens_here.iter().filter(|t| t.to_string() == token.to_string()).count();
+                                                                            if consumed_count < total_available {
+                                                                                let mut new_assigned = assigned.clone();
+                                                                                new_assigned.insert(var_name.clone(), token_value);
+                                                                                let mut new_consumed = consumed.clone();
+                                                                                new_consumed.push(token.clone());
+                                                                                next_partial.push((new_assigned, new_consumed));
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                partial_assignments = next_partial;
+                                                            }
+
+                                                            // Convert each complete assignment into a binding
+                                                            for (assigned, consumed) in partial_assignments {
+                                                                let mut new_binding = current_binding.clone();
+                                                                for (var, val) in assigned {
+                                                                    new_binding.variables.insert(var, val);
+                                                                }
+                                                                new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().extend(consumed);
+                                                                next_bindings_for_arc.push(new_binding);
+                                                            }
+                                                            continue;
+                                                        }
                                                     }
                                                 }
 
@@ -2592,7 +2726,7 @@ impl Simulator {
                 let is_output_arc = arc.source == *transition_id || 
                     (arc.is_bidirectional && arc.target == *transition_id);
                 
-                if is_output_arc {
+                if is_output_arc && !arc.is_inhibitor() && !arc.is_reset() {
                     for (var_name, colorset_name) in &self.declared_variables {
                         if selected_binding.variables.contains_key(var_name) {
                             continue;
@@ -2646,8 +2780,9 @@ impl Simulator {
         // Produce tokens on output arcs
         if let Some(net) = self.model.petri_nets.first() {
             let output_arcs: Vec<_> = net.arcs.iter().filter(|a| {
-                a.source == *transition_id || 
-                (a.is_bidirectional && a.target == *transition_id)
+                (a.source == *transition_id || 
+                (a.is_bidirectional && a.target == *transition_id))
+                && !a.is_inhibitor() && !a.is_reset()
             }).collect();
 
             for arc in output_arcs {

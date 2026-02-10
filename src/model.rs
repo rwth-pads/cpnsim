@@ -72,6 +72,20 @@ pub struct Arc {
     pub inscription: String, // Rhai expression string
     #[serde(default)]
     pub is_bidirectional: bool, // True if arc goes both directions
+    #[serde(default)]
+    pub arc_type: Option<String>, // "normal" (default), "inhibitor", or "reset"
+}
+
+impl Arc {
+    /// Returns true if this is an inhibitor arc
+    pub fn is_inhibitor(&self) -> bool {
+        self.arc_type.as_deref() == Some("inhibitor")
+    }
+    
+    /// Returns true if this is a reset arc
+    pub fn is_reset(&self) -> bool {
+        self.arc_type.as_deref() == Some("reset")
+    }
 }
 
 // --- Declarations ---

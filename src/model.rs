@@ -58,6 +58,8 @@ pub struct Transition {
     pub time: String, // Placeholder for potential timed CPNs
     #[serde(default)]
     pub priority: String, // Name of the priority level or empty
+    #[serde(default)]
+    pub code_segment: String, // Rhai code block executed when the transition fires
     pub position: Position,
     pub size: Size,
 }

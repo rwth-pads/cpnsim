@@ -415,6 +415,8 @@ pub struct Simulator {
     time_expressions: HashMap<String, AST>,
     // Compiled arc delay expressions (arc_id -> AST)
     arc_delay_expressions: HashMap<String, AST>,
+    // Compiled code segment ASTs (transition_id -> AST)
+    code_segment_asts: HashMap<String, AST>,
     declared_variables: HashMap<String, String>,
     parsed_color_sets: HashMap<String, ParsedColorSet>,
 }
@@ -1231,6 +1233,7 @@ impl Simulator {
         let mut initial_marking_expressions = HashMap::new();
         let mut time_expressions: HashMap<String, AST> = HashMap::new();
         let mut arc_delay_expressions: HashMap<String, AST> = HashMap::new();
+        let mut code_segment_asts: HashMap<String, AST> = HashMap::new();
 
         let mut current_marking: HashMap<String, Vec<Dynamic>> = HashMap::new();
         let mut token_timestamps: HashMap<String, Vec<i64>> = HashMap::new();
@@ -1485,6 +1488,20 @@ impl Simulator {
                         }
                     }
                 }
+                // Compile code segment if present (Rhai statements block)
+                let code_segment = transition.code_segment.trim();
+                if !code_segment.is_empty() {
+                    match engine.compile(code_segment) {
+                        Ok(ast) => {
+                            code_segment_asts.insert(transition.id.clone(), ast);
+                        }
+                        Err(e) => {
+                            let err_msg = format!("Error compiling code segment for transition {}: {}", transition.name, e);
+                            eprintln!("{}", err_msg);
+                            return Err(err_msg);
+                        }
+                    }
+                }
             }
             for arc in &net.arcs {
                 if !arc.inscription.is_empty() {
@@ -1605,6 +1622,7 @@ impl Simulator {
             initial_marking_expressions,
             time_expressions,
             arc_delay_expressions,
+            code_segment_asts,
             declared_variables,
             parsed_color_sets,
         })
@@ -1747,6 +1765,32 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Execute code segment if present (runs before output arc evaluation,
+        // so variables set here are available in output arc inscriptions)
+        if let Some(code_ast) = self.code_segment_asts.get(&selected_transition_id) {
+            match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, code_ast) {
+                Ok(_) => {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        web_sys::console::log_1(&format!(
+                            "[WASM] Code segment executed for transition {}",
+                            transition_to_fire.name
+                        ).into());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error executing code segment for transition {}: {}", transition_to_fire.name, e);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        web_sys::console::log_1(&format!(
+                            "[WASM] Error in code segment for transition {}: {}",
+                            transition_to_fire.name, e
+                        ).into());
                     }
                 }
             }
@@ -2711,6 +2755,7 @@ impl Simulator {
             initial_marking_expressions: self.initial_marking_expressions.clone(),
             time_expressions: self.time_expressions.clone(),
             arc_delay_expressions: self.arc_delay_expressions.clone(),
+            code_segment_asts: self.code_segment_asts.clone(),
             declared_variables: self.declared_variables.clone(),
             parsed_color_sets: self.parsed_color_sets.clone(),
         }
@@ -2790,6 +2835,31 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Execute code segment if present (runs before output arc evaluation)
+        if let Some(code_ast) = self.code_segment_asts.get(transition_id) {
+            match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, code_ast) {
+                Ok(_) => {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        web_sys::console::log_1(&format!(
+                            "[WASM] fire_transition_with_binding: Code segment executed for transition {}",
+                            transition_to_fire.name
+                        ).into());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error executing code segment for transition {}: {}", transition_to_fire.name, e);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        web_sys::console::log_1(&format!(
+                            "[WASM] Error in code segment for transition {}: {}",
+                            transition_to_fire.name, e
+                        ).into());
                     }
                 }
             }

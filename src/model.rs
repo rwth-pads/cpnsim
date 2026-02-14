@@ -71,6 +71,8 @@ pub struct Arc {
     pub target: String, // ID of target node (Place or Transition)
     pub inscription: String, // Rhai expression string
     #[serde(default)]
+    pub delay: String, // Per-arc time delay expression (Rhai), e.g. "delay_sec(5)"
+    #[serde(default)]
     pub is_bidirectional: bool, // True if arc goes both directions
     #[serde(default)]
     pub arc_type: Option<String>, // "normal" (default), "inhibitor", or "reset"

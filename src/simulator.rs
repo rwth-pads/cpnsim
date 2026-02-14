@@ -413,6 +413,8 @@ pub struct Simulator {
     initial_marking_expressions: HashMap<String, AST>,
     // Compiled transition time expressions (transition_id -> AST)
     time_expressions: HashMap<String, AST>,
+    // Compiled arc delay expressions (arc_id -> AST)
+    arc_delay_expressions: HashMap<String, AST>,
     declared_variables: HashMap<String, String>,
     parsed_color_sets: HashMap<String, ParsedColorSet>,
 }
@@ -1228,6 +1230,7 @@ impl Simulator {
         let mut arc_expressions = HashMap::new();
         let mut initial_marking_expressions = HashMap::new();
         let mut time_expressions: HashMap<String, AST> = HashMap::new();
+        let mut arc_delay_expressions: HashMap<String, AST> = HashMap::new();
 
         let mut current_marking: HashMap<String, Vec<Dynamic>> = HashMap::new();
         let mut token_timestamps: HashMap<String, Vec<i64>> = HashMap::new();
@@ -1496,6 +1499,30 @@ impl Simulator {
                         }
                     }
                 }
+                // Compile arc delay expression if present
+                if !arc.delay.is_empty() {
+                    let delay_expr = arc.delay.trim();
+                    // Strip "@+" prefix if present (CPN Tools format)
+                    let delay_expr = if delay_expr.starts_with("@+") {
+                        delay_expr[2..].trim()
+                    } else if delay_expr.starts_with("@") {
+                        delay_expr[1..].trim()
+                    } else {
+                        delay_expr
+                    };
+                    if !delay_expr.is_empty() {
+                        match engine.compile_expression(delay_expr) {
+                            Ok(ast) => {
+                                arc_delay_expressions.insert(arc.id.clone(), ast);
+                            }
+                            Err(e) => {
+                                let err_msg = format!("Error compiling delay expression for arc {}: {}", arc.id, e);
+                                eprintln!("{}", err_msg);
+                                return Err(err_msg);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1577,6 +1604,7 @@ impl Simulator {
             arc_expressions,
             initial_marking_expressions,
             time_expressions,
+            arc_delay_expressions,
             declared_variables,
             parsed_color_sets,
         })
@@ -1747,8 +1775,8 @@ impl Simulator {
             0
         };
 
-        // Calculate the timestamp for produced tokens (current_time + time_delay)
-        let produced_token_time = self.current_time + time_delay;
+        // Calculate the base timestamp for produced tokens (current_time + transition time_delay)
+        let base_produced_token_time = self.current_time + time_delay;
 
         if let Some(net) = self.model.petri_nets.first() {
             for arc in &net.arcs {
@@ -1764,6 +1792,21 @@ impl Simulator {
                     } else {
                         &arc.target
                     };
+
+                    // Evaluate per-arc delay expression if present
+                    let arc_delay: i64 = if let Some(delay_ast) = self.arc_delay_expressions.get(&arc.id) {
+                        match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, delay_ast) {
+                            Ok(result) => result.as_int().unwrap_or(0),
+                            Err(e) => {
+                                eprintln!("Error evaluating arc delay for arc {}: {}", arc.id, e);
+                                0
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    let produced_token_time = base_produced_token_time + arc_delay;
+
                     if let Some(ast) = self.arc_expressions.get(&arc.id) {
                         eprintln!("[DEBUG] Evaluating output arc {} to place {}: inscription = '{}'", arc.id, place_id, arc.inscription);
                         eprintln!("[DEBUG] Firing scope variables: {:?}", firing_scope.iter().map(|(n, _, v)| format!("{}={}", n, v)).collect::<Vec<_>>());
@@ -1808,7 +1851,7 @@ impl Simulator {
                                     let is_timed = self.timed_places.get(place_id).copied().unwrap_or(false);
                                     
                                     // For timed places, wrap tokens as timed token objects
-                                    // Use produced_token_time which includes the transition's time delay
+                                    // Use produced_token_time which includes transition time delay + arc delay
                                     let tokens_for_marking: Vec<Dynamic> = if is_timed {
                                         tokens_to_add.iter().map(|t| {
                                             // If it's already a timed token, preserve it; otherwise create one
@@ -2667,6 +2710,7 @@ impl Simulator {
             arc_expressions: self.arc_expressions.clone(),
             initial_marking_expressions: self.initial_marking_expressions.clone(),
             time_expressions: self.time_expressions.clone(),
+            arc_delay_expressions: self.arc_delay_expressions.clone(),
             declared_variables: self.declared_variables.clone(),
             parsed_color_sets: self.parsed_color_sets.clone(),
         }
@@ -2774,8 +2818,8 @@ impl Simulator {
             0
         };
 
-        // Calculate the timestamp for produced tokens (current_time + time_delay)
-        let produced_token_time = self.current_time + time_delay;
+        // Calculate the base timestamp for produced tokens (current_time + transition time_delay)
+        let base_produced_token_time = self.current_time + time_delay;
 
         // Produce tokens on output arcs
         if let Some(net) = self.model.petri_nets.first() {
@@ -2791,6 +2835,20 @@ impl Simulator {
                 } else {
                     &arc.target
                 };
+
+                // Evaluate per-arc delay expression if present
+                let arc_delay: i64 = if let Some(delay_ast) = self.arc_delay_expressions.get(&arc.id) {
+                    match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, delay_ast) {
+                        Ok(result) => result.as_int().unwrap_or(0),
+                        Err(e) => {
+                            eprintln!("Error evaluating arc delay for arc {}: {}", arc.id, e);
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+                let produced_token_time = base_produced_token_time + arc_delay;
 
                 if let Some(ast) = self.arc_expressions.get(&arc.id) {
                     match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {

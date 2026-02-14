@@ -2615,8 +2615,48 @@ impl Simulator {
             panic!("Cannot select from empty list of enabled transitions/bindings");
         }
 
+        // Determine the priority level for each enabled transition.
+        // Lower level number = higher priority.
+        // Transitions without a priority are treated as lowest priority (i64::MAX).
+        let with_priorities: Vec<(i64, &(String, Binding))> = enabled.iter().map(|pair| {
+            let transition = self.model.find_transition(&pair.0);
+            let level = transition
+                .and_then(|t| {
+                    let prio_name = t.priority.trim();
+                    if prio_name.is_empty() || prio_name == "NONE" {
+                        None
+                    } else {
+                        self.model.get_priority_level(prio_name)
+                    }
+                })
+                .unwrap_or(i64::MAX);
+            (level, pair)
+        }).collect();
+
+        // Find the highest priority (lowest level number) among enabled transitions
+        let best_level = with_priorities.iter().map(|(lvl, _)| *lvl).min().unwrap();
+
+        // Filter to only transitions at that priority level
+        let best: Vec<&(String, Binding)> = with_priorities.iter()
+            .filter(|(lvl, _)| *lvl == best_level)
+            .map(|(_, pair)| *pair)
+            .collect();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let all_names: Vec<String> = with_priorities.iter().map(|(lvl, (id, _))| {
+                format!("{}(pri={})", id, lvl)
+            }).collect();
+            let best_names: Vec<String> = best.iter().map(|(id, _)| id.clone()).collect();
+            web_sys::console::log_1(&format!(
+                "[WASM] Priority selection: enabled={:?}, best_level={}, candidates={:?}",
+                all_names, best_level, best_names
+            ).into());
+        }
+
+        // Randomly select among the highest-priority enabled transitions
         let mut rng = rand::rng();
-        let chosen_pair = enabled.choose(&mut rng)
+        let chosen_pair = best.choose(&mut rng)
             .expect("Internal error: Failed to choose from non-empty enabled bindings");
 
         (chosen_pair.0.clone(), chosen_pair.1.clone())

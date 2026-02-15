@@ -1669,14 +1669,19 @@ impl Simulator {
             if let Some(available_tokens) = self.current_marking.get_mut(place_id) {
                 let mut consumed_for_event: Vec<Dynamic> = Vec::new();
                 let mut remaining_tokens: Vec<Dynamic> = Vec::new();
+                let mut remaining_timestamps: Vec<i64> = Vec::new();
                 let mut needed_counts: HashMap<String, usize> = HashMap::new();
                 for token in tokens_to_consume {
                     *needed_counts.entry(token.to_string()).or_insert(0) += 1;
                 }
 
+                let current_timestamps = self.token_timestamps.get(place_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+
                 let mut current_counts: HashMap<String, usize> = HashMap::new();
 
-                for token in available_tokens.iter() {
+                for (index, token) in available_tokens.iter().enumerate() {
                     let token_str = token.to_string();
                     let needed_count = needed_counts.get(&token_str).copied().unwrap_or(0);
                     let current_count = current_counts.entry(token_str).or_insert(0);
@@ -1686,6 +1691,9 @@ impl Simulator {
                         *current_count += 1;
                     } else {
                         remaining_tokens.push(token.clone());
+                        if let Some(&ts) = current_timestamps.get(index) {
+                            remaining_timestamps.push(ts);
+                        }
                     }
                 }
 
@@ -1696,6 +1704,8 @@ impl Simulator {
 
                 if consumed_event_counts == needed_counts {
                     *available_tokens = remaining_tokens;
+                    // Keep token_timestamps in sync with current_marking
+                    self.token_timestamps.insert(place_id.clone(), remaining_timestamps);
                     consumed_tokens_event.insert(place_id.clone(), consumed_for_event);
                 } else {
                     eprintln!(
@@ -2816,14 +2826,19 @@ impl Simulator {
             if let Some(available_tokens) = self.current_marking.get_mut(place_id) {
                 let mut consumed_for_event = Vec::new();
                 let mut remaining_tokens = Vec::new();
+                let mut remaining_timestamps: Vec<i64> = Vec::new();
                 let mut needed_counts: HashMap<String, usize> = HashMap::new();
                 for token in tokens_to_consume {
                     *needed_counts.entry(token.to_string()).or_insert(0) += 1;
                 }
 
+                let current_timestamps = self.token_timestamps.get(place_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+
                 let mut current_counts: HashMap<String, usize> = HashMap::new();
 
-                for token in available_tokens.iter() {
+                for (index, token) in available_tokens.iter().enumerate() {
                     let token_str = token.to_string();
                     let needed_count = needed_counts.get(&token_str).copied().unwrap_or(0);
                     let current_count = current_counts.entry(token_str).or_insert(0);
@@ -2833,10 +2848,15 @@ impl Simulator {
                         *current_count += 1;
                     } else {
                         remaining_tokens.push(token.clone());
+                        if let Some(&ts) = current_timestamps.get(index) {
+                            remaining_timestamps.push(ts);
+                        }
                     }
                 }
 
                 *available_tokens = remaining_tokens;
+                // Keep token_timestamps in sync with current_marking
+                self.token_timestamps.insert(place_id.clone(), remaining_timestamps);
                 consumed_tokens_event.insert(place_id.clone(), consumed_for_event);
             }
         }

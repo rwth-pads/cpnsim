@@ -1862,11 +1862,8 @@ impl Simulator {
                     let produced_token_time = base_produced_token_time + arc_delay;
 
                     if let Some(ast) = self.arc_expressions.get(&arc.id) {
-                        eprintln!("[DEBUG] Evaluating output arc {} to place {}: inscription = '{}'", arc.id, place_id, arc.inscription);
-                        eprintln!("[DEBUG] Firing scope variables: {:?}", firing_scope.iter().map(|(n, _, v)| format!("{}={}", n, v)).collect::<Vec<_>>());
                         match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
                             Ok(produced_tokens_dynamic) => {
-                                eprintln!("[DEBUG] Output arc {} produced: {:?}", arc.id, produced_tokens_dynamic);
                                 // Check if the target place has a product colorset
                                 let is_product_place = self.is_place_product_type(place_id);
                                 
@@ -2166,25 +2163,16 @@ impl Simulator {
                                 */
                                 if let Some(bound_value) = current_binding.variables.get(var_name) {
                                     let bound_value_str = bound_value.to_string();
-                                    let mut found_match = false;
                                     for token in &available_tokens_here {
                                         // For timed tokens, compare the extracted value
                                         let token_value = extract_token_value(token);
-                                        if token_value.to_string() == bound_value_str {
-                                            /*
-                                            [DEBUG] Found matching token '{}' for variable '{}' in place '{}'
-                                            */
+                                        let token_value_str = token_value.to_string();
+                                        if token_value_str == bound_value_str {
                                             let mut new_binding = current_binding.clone();
                                             new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
                                             next_bindings_for_arc.push(new_binding);
-                                            found_match = true;
                                             break;
                                         }
-                                    }
-                                    if !found_match {
-                                        /*
-                                        [DEBUG] No matching token for already bound variable '{}' in place '{}'
-                                        */
                                     }
                                 } else {
                                     let mut unique_tokens_processed = HashSet::new();
@@ -2226,16 +2214,38 @@ impl Simulator {
                                 } else {
                                     match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut binding_scope, inscription_ast) {
                                         Ok(result_dynamic) => {
-                                            let required_tokens = Self::dynamic_to_vec_dynamic(result_dynamic);
-                                            match check_and_consume_multiset(&required_tokens, &available_token_indices, all_tokens_in_place) {
-                                                Some(consumed_for_this_arc) => {
-                                                    let mut new_binding = current_binding.clone();
-                                                    if !consumed_for_this_arc.is_empty() {
-                                                        new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().extend(consumed_for_this_arc);
+                                            // For product-typed places, the evaluated inscription
+                                            // (e.g. [ac, gate]) is a SINGLE product token, not a
+                                            // multiset of individual tokens.  Compare the whole
+                                            // product value against the extracted (un-timed) value
+                                            // of each available token.
+                                            let is_product = self.is_place_product_type(place_id);
+                                            if is_product {
+                                                let result_str = result_dynamic.to_string();
+                                                for token in &available_tokens_here {
+                                                    let token_value = extract_token_value(token);
+                                                    if token_value.to_string() == result_str {
+                                                        let mut new_binding = current_binding.clone();
+                                                        new_binding.consumed_tokens_map
+                                                            .entry(place_id.clone())
+                                                            .or_default()
+                                                            .push(token.clone());
+                                                        next_bindings_for_arc.push(new_binding);
+                                                        break; // one match per binding
                                                     }
-                                                    next_bindings_for_arc.push(new_binding);
                                                 }
-                                                None => {}
+                                            } else {
+                                                let required_tokens = Self::dynamic_to_vec_dynamic(result_dynamic);
+                                                match check_and_consume_multiset(&required_tokens, &available_token_indices, all_tokens_in_place) {
+                                                    Some(consumed_for_this_arc) => {
+                                                        let mut new_binding = current_binding.clone();
+                                                        if !consumed_for_this_arc.is_empty() {
+                                                            new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().extend(consumed_for_this_arc);
+                                                        }
+                                                        next_bindings_for_arc.push(new_binding);
+                                                    }
+                                                    None => {}
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -2426,6 +2436,7 @@ impl Simulator {
                     }
 
                     potential_bindings = next_bindings_for_arc;
+
                     if potential_bindings.is_empty() {
                         break;
                     }

@@ -1,7 +1,8 @@
 use crate::model::{PetriNetData, FiringEventData};
+use crate::monitor::{CompiledMonitor, MonitorConfig, MonitorResult, MonitorType};
 use rhai::{Engine, Scope, Dynamic, AST, Module, EvalAltResult, NativeCallContext};
-use std::collections::{HashMap, HashSet};
-use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::cell::{Cell, RefCell};
 use rand::prelude::*;
 use rand_distr::{Distribution, Bernoulli, Beta, Binomial, ChiSquared, Exp, Gamma, Normal, Poisson, StudentT, Uniform, Weibull};
 use chrono::{DateTime, Utc, Datelike, Timelike, Duration, Weekday};
@@ -14,6 +15,10 @@ use chrono::{DateTime, Utc, Datelike, Timelike, Duration, Weekday};
 thread_local! {
     static SIM_CURRENT_TIME: Cell<i64> = Cell::new(0);
     static SIM_EPOCH_MS: Cell<i64> = Cell::new(0);
+    /// Per-distribution-function override values for deterministic state space analysis.
+    /// When a key exists, the corresponding distribution function returns the override value
+    /// instead of sampling randomly.
+    static DIST_OVERRIDES: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
 }
 
 // Represents a potential binding for a transition
@@ -419,6 +424,15 @@ pub struct Simulator {
     code_segment_asts: HashMap<String, AST>,
     declared_variables: HashMap<String, String>,
     parsed_color_sets: HashMap<String, ParsedColorSet>,
+    // Monitors
+    monitors: Vec<CompiledMonitor>,
+    step_counter: u64,
+    // Last binding from the most recent transition firing (for monitor scripts)
+    last_binding: HashMap<String, Dynamic>,
+    /// Per-variable override values for IntRange random bindings.
+    /// When a key (variable name) exists, the override value is used instead of
+    /// generating a random value within the colorset's range.
+    int_range_overrides: HashMap<String, i64>,
 }
 
 // ============================================================================
@@ -981,6 +995,9 @@ fn dist_bernoulli(p: f64) -> Result<i64, Box<EvalAltResult>> {
     if p < 0.0 || p > 1.0 {
         return Err(format!("Bernoulli: p must be in [0, 1], got {}", p).into());
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("bernoulli").copied()) {
+        return Ok(val as i64);
+    }
     let dist = Bernoulli::new(p).map_err(|e| format!("Bernoulli error: {}", e))?;
     let mut rng = rand::rng();
     Ok(if dist.sample(&mut rng) { 1 } else { 0 })
@@ -991,6 +1008,9 @@ fn dist_bernoulli(p: f64) -> Result<i64, Box<EvalAltResult>> {
 fn dist_beta(a: f64, b: f64) -> Result<f64, Box<EvalAltResult>> {
     if a <= 0.0 || b <= 0.0 {
         return Err(format!("Beta: a and b must be > 0, got a={}, b={}", a, b).into());
+    }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("beta").copied()) {
+        return Ok(val);
     }
     let dist = Beta::new(a, b).map_err(|e| format!("Beta error: {}", e))?;
     let mut rng = rand::rng();
@@ -1006,6 +1026,9 @@ fn dist_binomial(n: i64, p: f64) -> Result<i64, Box<EvalAltResult>> {
     if p < 0.0 || p > 1.0 {
         return Err(format!("Binomial: p must be in [0, 1], got {}", p).into());
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("binomial").copied()) {
+        return Ok(val as i64);
+    }
     let dist = Binomial::new(n as u64, p).map_err(|e| format!("Binomial error: {}", e))?;
     let mut rng = rand::rng();
     Ok(dist.sample(&mut rng) as i64)
@@ -1017,6 +1040,9 @@ fn dist_chisq(n: i64) -> Result<f64, Box<EvalAltResult>> {
     if n < 1 {
         return Err(format!("Chisq: n must be >= 1, got {}", n).into());
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("chisq").copied()) {
+        return Ok(val);
+    }
     let dist = ChiSquared::new(n as f64).map_err(|e| format!("Chisq error: {}", e))?;
     let mut rng = rand::rng();
     Ok(dist.sample(&mut rng))
@@ -1027,6 +1053,9 @@ fn dist_chisq(n: i64) -> Result<f64, Box<EvalAltResult>> {
 fn dist_discrete(a: i64, b: i64) -> Result<i64, Box<EvalAltResult>> {
     if a > b {
         return Err(format!("Discrete: a must be <= b, got a={}, b={}", a, b).into());
+    }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("discrete").copied()) {
+        return Ok(val as i64);
     }
     let mut rng = rand::rng();
     Ok(rng.random_range(a..=b))
@@ -1042,6 +1071,9 @@ fn dist_erlang(n: i64, r: f64) -> Result<f64, Box<EvalAltResult>> {
     if r <= 0.0 {
         return Err(format!("Erlang: r must be > 0, got {}", r).into());
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("erlang").copied()) {
+        return Ok(val);
+    }
     // Erlang(n, r) = Gamma(n, 1/r) where r is the rate
     let dist = Gamma::new(n as f64, 1.0 / r).map_err(|e| format!("Erlang error: {}", e))?;
     let mut rng = rand::rng();
@@ -1054,6 +1086,9 @@ fn dist_exponential(r: f64) -> Result<f64, Box<EvalAltResult>> {
     if r <= 0.0 {
         return Err(format!("Exponential: r must be > 0, got {}", r).into());
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("exponential").copied()) {
+        return Ok(val);
+    }
     let dist = Exp::new(r).map_err(|e| format!("Exponential error: {}", e))?;
     let mut rng = rand::rng();
     Ok(dist.sample(&mut rng))
@@ -1064,6 +1099,9 @@ fn dist_exponential(r: f64) -> Result<f64, Box<EvalAltResult>> {
 fn dist_gamma(l: f64, k: f64) -> Result<f64, Box<EvalAltResult>> {
     if l <= 0.0 || k <= 0.0 {
         return Err(format!("Gamma: l and k must be > 0, got l={}, k={}", l, k).into());
+    }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("gamma").copied()) {
+        return Ok(val);
     }
     // rand_distr::Gamma uses (shape, scale) = (k, l)
     let dist = Gamma::new(k, l).map_err(|e| format!("Gamma error: {}", e))?;
@@ -1076,6 +1114,9 @@ fn dist_gamma(l: f64, k: f64) -> Result<f64, Box<EvalAltResult>> {
 fn dist_normal(n: f64, v: f64) -> Result<f64, Box<EvalAltResult>> {
     if v < 0.0 {
         return Err(format!("Normal: variance must be >= 0, got {}", v).into());
+    }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("normal").copied()) {
+        return Ok(val);
     }
     if v == 0.0 {
         return Ok(n); // Zero variance means constant value
@@ -1093,6 +1134,9 @@ fn dist_poisson(m: f64) -> Result<i64, Box<EvalAltResult>> {
     if m <= 0.0 {
         return Err(format!("Poisson: m must be > 0, got {}", m).into());
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("poisson").copied()) {
+        return Ok(val as i64);
+    }
     let dist = Poisson::new(m).map_err(|e| format!("Poisson error: {}", e))?;
     let mut rng = rand::rng();
     Ok(dist.sample(&mut rng) as i64)
@@ -1107,6 +1151,9 @@ fn dist_rayleigh(s: f64) -> Result<f64, Box<EvalAltResult>> {
     if s == 0.0 {
         return Ok(0.0); // Zero scale means constant 0
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("rayleigh").copied()) {
+        return Ok(val);
+    }
     // Rayleigh is a special case of Weibull with shape=2
     // Or we can use: X = s * sqrt(-2 * ln(U)) where U is uniform(0,1)
     let mut rng = rand::rng();
@@ -1119,6 +1166,9 @@ fn dist_rayleigh(s: f64) -> Result<f64, Box<EvalAltResult>> {
 fn dist_student(n: i64) -> Result<f64, Box<EvalAltResult>> {
     if n < 1 {
         return Err(format!("Student: n must be >= 1, got {}", n).into());
+    }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("student").copied()) {
+        return Ok(val);
     }
     let dist = StudentT::new(n as f64).map_err(|e| format!("Student error: {}", e))?;
     let mut rng = rand::rng();
@@ -1134,6 +1184,9 @@ fn dist_uniform(a: f64, b: f64) -> Result<f64, Box<EvalAltResult>> {
     if a == b {
         return Ok(a);
     }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("uniform").copied()) {
+        return Ok(val);
+    }
     let dist = Uniform::new_inclusive(a, b).map_err(|e| format!("Uniform error: {}", e))?;
     let mut rng = rand::rng();
     Ok(dist.sample(&mut rng))
@@ -1144,6 +1197,9 @@ fn dist_uniform(a: f64, b: f64) -> Result<f64, Box<EvalAltResult>> {
 fn dist_weibull(lambda: f64, k: f64) -> Result<f64, Box<EvalAltResult>> {
     if lambda <= 0.0 || k <= 0.0 {
         return Err(format!("Weibull: lambda and k must be > 0, got lambda={}, k={}", lambda, k).into());
+    }
+    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("weibull").copied()) {
+        return Ok(val);
     }
     let dist = Weibull::new(lambda, k).map_err(|e| format!("Weibull error: {}", e))?;
     let mut rng = rand::rng();
@@ -1625,6 +1681,10 @@ impl Simulator {
             code_segment_asts,
             declared_variables,
             parsed_color_sets,
+            monitors: Vec::new(),
+            step_counter: 0,
+            last_binding: HashMap::new(),
+            int_range_overrides: HashMap::new(),
         })
     }
 
@@ -1763,14 +1823,18 @@ impl Simulator {
                         if let Some(parsed_cs) = self.parsed_color_sets.get(colorset_name) {
                             if parsed_cs.kind == ColorSetKind::IntRange {
                                 if let Some((start, end)) = parsed_cs.range {
-                                    // Generate random value within range
-                                    let random_value = rng.random_range(start..=end);
+                                    // Use override value if set, otherwise generate random
+                                    let value = if let Some(&override_val) = self.int_range_overrides.get(var_name) {
+                                        override_val.max(start).min(end) // clamp to range
+                                    } else {
+                                        rng.random_range(start..=end)
+                                    };
                                     #[cfg(target_arch = "wasm32")]
                                     {
                                         // Log to browser console in WASM
-                                        web_sys::console::log_1(&format!("[WASM] Binding random variable {} to {} (from colorset {} with range {}..{})", var_name, random_value, colorset_name, start, end).into());
+                                        web_sys::console::log_1(&format!("[WASM] Binding random variable {} to {} (from colorset {} with range {}..{})", var_name, value, colorset_name, start, end).into());
                                     }
-                                    firing_scope.push_constant(var_name, Dynamic::from(random_value));
+                                    firing_scope.push_constant(var_name, Dynamic::from(value));
                                     already_bound_random.insert(var_name.clone());
                                 }
                             }
@@ -1946,12 +2010,26 @@ impl Simulator {
         }
 
         let event_data = FiringEventData {
-            transition_id: selected_transition_id,
+            transition_id: selected_transition_id.clone(),
             transition_name: transition_to_fire.name.clone(),
             simulation_time: self.current_time,
             consumed: consumed_tokens_event,
             produced: produced_tokens_event,
         };
+
+        // Update monitor state: save binding & increment step
+        self.last_binding = selected_binding.variables.clone();
+        self.step_counter += 1;
+
+        // Evaluate monitors after the step
+        let consumed_pids: Vec<String> = event_data.consumed.keys().cloned().collect();
+        let produced_pids: Vec<String> = event_data.produced.keys().cloned().collect();
+        self.evaluate_monitors(
+            &event_data.transition_id,
+            &event_data.transition_name,
+            &consumed_pids,
+            &produced_pids,
+        );
 
         Some(event_data)
     }
@@ -2819,6 +2897,10 @@ impl Simulator {
             code_segment_asts: self.code_segment_asts.clone(),
             declared_variables: self.declared_variables.clone(),
             parsed_color_sets: self.parsed_color_sets.clone(),
+            monitors: Vec::new(), // Don't clone monitors for check
+            step_counter: self.step_counter,
+            last_binding: HashMap::new(),
+            int_range_overrides: self.int_range_overrides.clone(),
         }
     }
 
@@ -2900,8 +2982,13 @@ impl Simulator {
                         if let Some(parsed_cs) = self.parsed_color_sets.get(colorset_name) {
                             if parsed_cs.kind == ColorSetKind::IntRange {
                                 if let Some((start, end)) = parsed_cs.range {
-                                    let random_value = rng.random_range(start..=end);
-                                    firing_scope.push_constant(var_name, Dynamic::from(random_value));
+                                    // Use override value if set, otherwise generate random
+                                    let value = if let Some(&override_val) = self.int_range_overrides.get(var_name) {
+                                        override_val.max(start).min(end) // clamp to range
+                                    } else {
+                                        rng.random_range(start..=end)
+                                    };
+                                    firing_scope.push_constant(var_name, Dynamic::from(value));
                                     already_bound_random.insert(var_name.clone());
                                 }
                             }
@@ -3161,4 +3248,517 @@ impl Simulator {
 
         true
     }
+
+    // ========================================================================
+    // Monitor API
+    // ========================================================================
+
+    /// Register a monitor from its JSON config. Compiles Rhai scripts.
+    pub fn add_monitor(&mut self, config: MonitorConfig) -> Result<(), String> {
+        let observation_ast = if !config.observation_script.is_empty() {
+            Some(
+                self.rhai_engine
+                    .compile(&config.observation_script)
+                    .map_err(|e| format!("Monitor '{}' observation script error: {}", config.name, e))?,
+            )
+        } else {
+            None
+        };
+
+        let predicate_ast = if !config.predicate_script.is_empty() {
+            Some(
+                self.rhai_engine
+                    .compile(&config.predicate_script)
+                    .map_err(|e| format!("Monitor '{}' predicate script error: {}", config.name, e))?,
+            )
+        } else {
+            None
+        };
+
+        self.monitors
+            .push(CompiledMonitor::new(config, observation_ast, predicate_ast));
+        Ok(())
+    }
+
+    /// Remove a monitor by its ID.
+    pub fn remove_monitor(&mut self, id: &str) {
+        self.monitors.retain(|m| m.config.id != id);
+    }
+
+    /// Clear all monitor results (but keep the monitor definitions).
+    pub fn clear_monitor_results(&mut self) {
+        for monitor in &mut self.monitors {
+            monitor.result = MonitorResult::new(
+                &monitor.config.id,
+                &monitor.config.name,
+                monitor.config.monitor_type.clone(),
+            );
+            monitor.step_count = 0;
+        }
+    }
+
+    /// Get all monitor results (with finalized statistics).
+    pub fn get_monitor_results(&mut self) -> Vec<MonitorResult> {
+        for monitor in &mut self.monitors {
+            monitor.result.finalize_statistics();
+        }
+        self.monitors.iter().map(|m| m.result.clone()).collect()
+    }
+
+    /// Check if any monitor has triggered a breakpoint.
+    pub fn has_breakpoint_hit(&self) -> bool {
+        self.monitors.iter().any(|m| m.result.breakpoint_hit)
+    }
+
+    /// Evaluate all enabled monitors after a simulation step.
+    fn evaluate_monitors(
+        &mut self,
+        transition_id: &str,
+        transition_name: &str,
+        consumed_place_ids: &[String],
+        produced_place_ids: &[String],
+    ) {
+        // Build place token counts from current marking
+        let place_token_counts: HashMap<String, i64> = self
+            .current_marking
+            .iter()
+            .map(|(pid, tokens)| (pid.clone(), tokens.len() as i64))
+            .collect();
+
+        let step = self.step_counter;
+        let time = self.current_time;
+        let binding_vars = self.last_binding.clone();
+
+        let consumed_set: HashSet<&str> = consumed_place_ids.iter().map(|s| s.as_str()).collect();
+        let produced_set: HashSet<&str> = produced_place_ids.iter().map(|s| s.as_str()).collect();
+
+        // Pre-build a base Rhai scope (shared context for all DataCollector monitors)
+        let base_scope = build_monitor_scope(
+            step,
+            time,
+            transition_id,
+            transition_name,
+            &place_token_counts,
+            &binding_vars,
+        );
+
+        for monitor in &mut self.monitors {
+            if !monitor.config.enabled {
+                continue;
+            }
+
+            match monitor.config.monitor_type {
+                MonitorType::MarkingSize => {
+                    // Built-in: sum token counts of watched places
+                    if monitor.config.place_ids.is_empty() {
+                        continue;
+                    }
+                    // Only record if any watched place was affected (or it's step 1)
+                    let affected = step == 1
+                        || monitor.config.place_ids.iter().any(|pid| {
+                            consumed_set.contains(pid.as_str())
+                                || produced_set.contains(pid.as_str())
+                        });
+                    if !affected {
+                        continue;
+                    }
+                    let value: f64 = monitor
+                        .config
+                        .place_ids
+                        .iter()
+                        .map(|pid| *place_token_counts.get(pid).unwrap_or(&0) as f64)
+                        .sum();
+                    monitor.result.record(step, time, value);
+                }
+
+                MonitorType::TransitionCount => {
+                    // Built-in: count firings of watched transitions
+                    if monitor.config.transition_ids.contains(&transition_id.to_string()) {
+                        monitor.step_count += 1;
+                        monitor.result.record(step, time, monitor.step_count as f64);
+                    }
+                }
+
+                MonitorType::BreakpointPlace => {
+                    // Built-in: check stop condition on watched places
+                    let condition = monitor
+                        .config
+                        .stop_condition
+                        .as_deref()
+                        .unwrap_or("empty");
+                    let triggered = monitor.config.place_ids.iter().any(|pid| {
+                        let count = *place_token_counts.get(pid).unwrap_or(&0);
+                        match condition {
+                            "empty" => count == 0,
+                            "not-empty" => count > 0,
+                            _ => false,
+                        }
+                    });
+                    if triggered {
+                        monitor.result.breakpoint_hit = true;
+                        let value: f64 = monitor
+                            .config
+                            .place_ids
+                            .iter()
+                            .map(|pid| *place_token_counts.get(pid).unwrap_or(&0) as f64)
+                            .sum();
+                        monitor.result.record(step, time, value);
+                    }
+                }
+
+                MonitorType::BreakpointTransition => {
+                    // Built-in: stop when watched transition fires
+                    if monitor.config.transition_ids.contains(&transition_id.to_string()) {
+                        monitor.result.breakpoint_hit = true;
+                        monitor.result.record(step, time, 1.0);
+                    }
+                }
+
+                MonitorType::DataCollector => {
+                    // User-defined: evaluate Rhai scripts
+                    // Use direct field access to self.rhai_engine to avoid borrow conflict
+                    let should_record = if let Some(ref predicate_ast) = monitor.predicate_ast {
+                        let mut scope = base_scope.clone();
+                        match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut scope, predicate_ast) {
+                            Ok(val) => val.as_bool().unwrap_or(true),
+                            Err(e) => {
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    web_sys::console::log_1(
+                                        &format!(
+                                            "[WASM] Monitor '{}' predicate error: {}",
+                                            monitor.config.name, e
+                                        )
+                                        .into(),
+                                    );
+                                }
+                                let _ = e; // suppress unused warning on non-wasm
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+
+                    if should_record {
+                        if let Some(ref observation_ast) = monitor.observation_ast {
+                            let mut scope = base_scope.clone();
+                            match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut scope, observation_ast) {
+                                Ok(val) => {
+                                    let value = if let Ok(f) = val.as_float() {
+                                        f
+                                    } else if let Ok(i) = val.as_int() {
+                                        i as f64
+                                    } else {
+                                        0.0
+                                    };
+                                    monitor.result.record(step, time, value);
+                                }
+                                Err(e) => {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        web_sys::console::log_1(
+                                            &format!(
+                                                "[WASM] Monitor '{}' observation error: {}",
+                                                monitor.config.name, e
+                                            )
+                                            .into(),
+                                        );
+                                    }
+                                    let _ = e;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reset step counter and monitors when simulation resets.
+    pub fn reset_monitors(&mut self) {
+        self.step_counter = 0;
+        self.last_binding.clear();
+        self.clear_monitor_results();
+    }
+
+    // ========================================================================
+    // State Space Analysis
+    // ========================================================================
+
+    /// Calculate the full (or bounded) state space.
+    /// Uses BFS to explore all reachable markings from the current state.
+    /// Returns a StateSpaceResult containing the report and reachability graph.
+    ///
+    /// When `dist_overrides` or `int_range_overrides` are provided, the calculation
+    /// runs in deterministic mode: distribution functions return their override values
+    /// and IntRange variable bindings use the specified fixed values instead of random.
+    pub fn calculate_state_space(
+        &mut self,
+        max_states: u32,
+        max_arcs: u32,
+        is_timed: bool,
+        dist_overrides: Option<HashMap<String, f64>>,
+        int_range_overrides: Option<HashMap<String, i64>>,
+    ) -> crate::statespace::StateSpaceResult {
+        use crate::statespace::*;
+
+        // Set deterministic overrides before exploration
+        if let Some(ref overrides) = dist_overrides {
+            DIST_OVERRIDES.with(|o| {
+                *o.borrow_mut() = overrides.clone();
+            });
+        }
+        if let Some(ref overrides) = int_range_overrides {
+            self.int_range_overrides = overrides.clone();
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let start_time = std::time::Instant::now();
+
+        // Auto-detect timed model: check parallel timestamps AND embedded token timestamps,
+        // and also check if any transition has a time expression or any color set is timed.
+        let auto_timed = self.token_timestamps.values()
+            .any(|ts_vec| ts_vec.iter().any(|&ts| ts != 0))
+            || self.current_marking.values().any(|tokens| {
+                tokens.iter().any(|t| extract_token_timestamp(t) != 0)
+            })
+            || !self.time_expressions.is_empty();
+        let use_timed = is_timed || auto_timed;
+
+        // Collect all transitions for the report
+        let all_transitions: Vec<(String, String)> = if let Some(net) = self.model.petri_nets.first() {
+            net.transitions.iter().map(|t| (t.id.clone(), t.name.clone())).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Collect place names for display
+        let place_names: HashMap<String, String> = if let Some(net) = self.model.petri_nets.first() {
+            net.places.iter().map(|p| (p.id.clone(), p.name.clone())).collect()
+        } else {
+            HashMap::new()
+        };
+
+        // Save the original state so we can restore after exploration
+        let original_marking = self.current_marking.clone();
+        let original_timestamps = self.token_timestamps.clone();
+        let original_time = self.current_time;
+
+        // State tracking
+        let mut visited: HashMap<CanonicalMarking, u32> = HashMap::new(); // canonical -> state_id
+        let mut nodes: Vec<StateNode> = Vec::new();
+        let mut arcs: Vec<StateArc> = Vec::new();
+        let mut queue: VecDeque<(u32, HashMap<String, Vec<Dynamic>>, HashMap<String, Vec<i64>>, i64)> = VecDeque::new();
+        let mut state_counter: u32 = 0;
+        let mut limit_reached = false;
+        let mut explored: HashSet<u32> = HashSet::new(); // states that were actually expanded (popped from queue)
+
+        // Add initial state
+        let initial_canonical = CanonicalMarking::from_marking(&self.current_marking, self.current_time, use_timed);
+        state_counter += 1;
+        let initial_id = state_counter;
+        let initial_node = marking_to_state_node(initial_id, &self.current_marking, self.current_time);
+        nodes.push(initial_node);
+        visited.insert(initial_canonical, initial_id);
+        queue.push_back((initial_id, self.current_marking.clone(), self.token_timestamps.clone(), self.current_time));
+
+        // BFS exploration
+        while let Some((current_state_id, marking, timestamps, time)) = queue.pop_front() {
+            // Check limits
+            if max_states > 0 && state_counter >= max_states {
+                limit_reached = true;
+                break;
+            }
+            if max_arcs > 0 && arcs.len() as u32 >= max_arcs {
+                limit_reached = true;
+                break;
+            }
+
+            // Mark this state as explored (we are expanding its successors)
+            explored.insert(current_state_id);
+
+            // Restore the marking to this state
+            self.current_marking = marking.clone();
+            self.token_timestamps = timestamps.clone();
+            self.current_time = time;
+
+            // Find all enabled bindings at this state
+            let enabled_bindings = self.find_enabled_bindings();
+
+            if enabled_bindings.is_empty() && use_timed {
+                // Timed model: no transitions enabled at current time.
+                // Advance clock to the earliest future token timestamp.
+                // Use the same method as run_step() to check both parallel timestamps
+                // and embedded timestamps in tokens.
+                if let Some(next_time) = self.find_earliest_future_token_time() {
+                    self.current_time = next_time;
+                    let time_canonical = CanonicalMarking::from_marking(
+                        &self.current_marking, self.current_time, true,
+                    );
+
+                    let successor_id = if let Some(&existing_id) = visited.get(&time_canonical) {
+                        existing_id
+                    } else {
+                        if max_states > 0 && state_counter >= max_states {
+                            limit_reached = true;
+                            continue;
+                        }
+                        state_counter += 1;
+                        let new_id = state_counter;
+                        let time_node = marking_to_state_node(new_id, &self.current_marking, self.current_time);
+                        nodes.push(time_node);
+                        visited.insert(time_canonical, new_id);
+                        queue.push_back((new_id, self.current_marking.clone(), self.token_timestamps.clone(), self.current_time));
+                        new_id
+                    };
+
+                    arcs.push(StateArc {
+                        from: current_state_id,
+                        to: successor_id,
+                        transition_id: "__time__".to_string(),
+                        transition_name: "Time".to_string(),
+                        binding: format!("@{}", next_time),
+                    });
+                }
+                // If no future timestamps, this is a true dead state
+                continue;
+            }
+
+            // For each enabled binding, fire it and record the successor state
+            for (transition_id, binding) in &enabled_bindings {
+                // Save marking before firing
+                let pre_marking = self.current_marking.clone();
+                let pre_timestamps = self.token_timestamps.clone();
+                let pre_time = self.current_time;
+
+                // Get transition name
+                let transition_name = self.model.find_transition(transition_id)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| transition_id.clone());
+
+                // Build binding description
+                let binding_str = binding.variables.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                // Fire the transition
+                let _event = self.fire_transition_with_binding(transition_id, binding.clone());
+
+                // Record successor state
+                let successor_canonical = CanonicalMarking::from_marking(&self.current_marking, self.current_time, use_timed);
+
+                let successor_id = if let Some(&existing_id) = visited.get(&successor_canonical) {
+                    existing_id
+                } else {
+                    state_counter += 1;
+                    let new_id = state_counter;
+                    let successor_node = marking_to_state_node(new_id, &self.current_marking, self.current_time);
+                    nodes.push(successor_node);
+                    visited.insert(successor_canonical, new_id);
+                    queue.push_back((new_id, self.current_marking.clone(), self.token_timestamps.clone(), self.current_time));
+                    new_id
+                };
+
+                arcs.push(StateArc {
+                    from: current_state_id,
+                    to: successor_id,
+                    transition_id: transition_id.clone(),
+                    transition_name: transition_name.clone(),
+                    binding: binding_str,
+                });
+
+                // Restore the marking to try the next binding from the same state
+                self.current_marking = pre_marking;
+                self.token_timestamps = pre_timestamps;
+                self.current_time = pre_time;
+
+                // Check arc limit mid-loop
+                if max_arcs > 0 && arcs.len() as u32 >= max_arcs {
+                    limit_reached = true;
+                    break;
+                }
+            }
+        }
+
+        // Restore original state
+        self.current_marking = original_marking;
+        self.token_timestamps = original_timestamps;
+        self.current_time = original_time;
+
+        // Clear deterministic overrides
+        DIST_OVERRIDES.with(|o| o.borrow_mut().clear());
+        self.int_range_overrides.clear();
+
+        #[cfg(target_arch = "wasm32")]
+        let calc_time_ms: u64 = 0; // timing not available in WASM
+        #[cfg(not(target_arch = "wasm32"))]
+        let calc_time_ms = start_time.elapsed().as_millis() as u64;
+        let is_full = !limit_reached;
+
+        // Update place names in bounds
+        let mut report = compute_report(&nodes, &arcs, is_full, limit_reached, calc_time_ms, &all_transitions, &explored);
+        for bound in &mut report.place_bounds {
+            if let Some(name) = place_names.get(&bound.place_id) {
+                bound.place_name = name.clone();
+            }
+        }
+
+        StateSpaceResult {
+            report,
+            graph: StateSpaceGraph { nodes, arcs },
+        }
+    }
+}
+
+/// Convert a marking to a StateNode for serialization.
+fn marking_to_state_node(
+    id: u32,
+    marking: &HashMap<String, Vec<Dynamic>>,
+    time: i64,
+) -> crate::statespace::StateNode {
+    use std::collections::BTreeMap;
+    let mut m = BTreeMap::new();
+    for (place_id, tokens) in marking {
+        if !tokens.is_empty() {
+            let token_strs: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            m.insert(place_id.clone(), token_strs);
+        }
+    }
+    crate::statespace::StateNode {
+        id,
+        marking: m,
+        time,
+    }
+}
+
+/// Build a Rhai scope with monitor context variables (free function to avoid borrow conflicts).
+fn build_monitor_scope(
+    step: u64,
+    time: i64,
+    transition_id: &str,
+    transition_name: &str,
+    place_token_counts: &HashMap<String, i64>,
+    binding_vars: &HashMap<String, Dynamic>,
+) -> Scope<'static> {
+    let mut scope = Scope::new();
+    scope.push_constant("step", step as i64);
+    scope.push_constant("time", time);
+    scope.push_constant("transition_id", transition_id.to_string());
+    scope.push_constant("transition_name", transition_name.to_string());
+
+    // Build markings map: place_id -> token count
+    let mut markings_map = rhai::Map::new();
+    for (pid, count) in place_token_counts {
+        markings_map.insert(pid.clone().into(), Dynamic::from(*count));
+    }
+    scope.push_constant("markings", markings_map);
+
+    // Push binding variables directly into scope
+    for (var_name, value) in binding_vars {
+        scope.push_constant(var_name, value.clone());
+    }
+
+    scope
 }

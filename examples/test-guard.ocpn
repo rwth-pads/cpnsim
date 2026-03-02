@@ -1,0 +1,67 @@
+{
+  "petriNets": [
+    {
+      "id": "ID6",
+      "name": "Main",
+      "places": [
+        {
+          "id": "a",
+          "name": "start",
+          "colorSet": "INT",
+          "initialMarking": "[1, 5, 5, 10]",
+          "marking": "[1,5,5,10]",
+          "position": { "x": -200, "y": 0 },
+          "size": { "width": 30, "height": 30 }
+        },
+        {
+          "id": "c",
+          "name": "end place",
+          "colorSet": "INT",
+          "initialMarking": "[]",
+          "marking": "[]",
+          "position": { "x": 0, "y": 200 },
+          "size": { "width": 50, "height": 30 }
+        }
+      ],
+      "transitions": [
+        {
+          "id": "b",
+          "name": "transition",
+          "guard": "var1>4",
+          "time": "",
+          "priority": "",
+          "codeSegment": "",
+          "position": { "x": -110, "y": 100 },
+          "size": { "width": 70, "height": 30 }
+        }
+      ],
+      "arcs": [
+        {
+          "id": "a->b",
+          "source": "a",
+          "target": "b",
+          "inscription": "var1",
+          "delay": "",
+          "isBidirectional": false
+        },
+        {
+          "id": "b->c",
+          "source": "b",
+          "target": "c",
+          "inscription": "var1",
+          "delay": "",
+          "isBidirectional": false
+        }
+      ]
+    }
+  ],
+  "colorSets": [
+    { "id": "cs1", "name": "INT", "type": "basic", "definition": "colset INT = int;", "color": "#3b82f6" }
+  ],
+  "variables": [
+    { "id": "v1", "name": "var1", "colorSet": "INT" }
+  ],
+  "priorities": [],
+  "functions": [],
+  "uses": []
+}

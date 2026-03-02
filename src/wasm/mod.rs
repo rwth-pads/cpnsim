@@ -1,8 +1,10 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use crate::CoreSimulator;
+use crate::monitor::MonitorConfig;
 use js_sys::{Function, Array};
-use serde_wasm_bindgen::to_value;
+use serde_wasm_bindgen::{to_value, from_value};
+use std::collections::HashMap;
 
 #[wasm_bindgen]
 extern "C" {
@@ -162,5 +164,108 @@ impl WasmSimulator {
     #[wasm_bindgen(js_name = advanceTime)]
     pub fn advance_time(&mut self, delta_ms: i64) {
         self.simulator.advance_time(delta_ms);
+    }
+
+    // ========================================================================
+    // Monitor API
+    // ========================================================================
+
+    /// Register a monitor from a JSON config object.
+    /// The config should match the MonitorConfig schema:
+    /// { id, name, type, enabled, placeIds, transitionIds,
+    ///   observationScript, predicateScript, stopCondition }
+    #[wasm_bindgen(js_name = addMonitor)]
+    pub fn add_monitor(&mut self, config_js: JsValue) -> Result<(), JsValue> {
+        let config: MonitorConfig = serde_wasm_bindgen::from_value(config_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid monitor config: {}", e)))?;
+        console_log!("[WASM] Adding monitor '{}' (type: {:?})", config.name, config.monitor_type);
+        self.simulator
+            .add_monitor(config)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Remove a monitor by its ID.
+    #[wasm_bindgen(js_name = removeMonitor)]
+    pub fn remove_monitor(&mut self, id: &str) {
+        console_log!("[WASM] Removing monitor '{}'", id);
+        self.simulator.remove_monitor(id);
+    }
+
+    /// Get all monitor results as a JSON array.
+    /// Each result: { monitorId, monitorName, monitorType, observations, statistics, breakpointHit }
+    #[wasm_bindgen(js_name = getMonitorResults)]
+    pub fn get_monitor_results(&mut self) -> Result<JsValue, JsValue> {
+        let results = self.simulator.get_monitor_results();
+        to_value(&results).map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+    }
+
+    /// Clear all monitor results (keeps definitions).
+    #[wasm_bindgen(js_name = clearMonitorResults)]
+    pub fn clear_monitor_results(&mut self) {
+        console_log!("[WASM] Clearing monitor results");
+        self.simulator.clear_monitor_results();
+    }
+
+    /// Check if any breakpoint monitor was triggered.
+    #[wasm_bindgen(js_name = hasBreakpointHit)]
+    pub fn has_breakpoint_hit(&self) -> bool {
+        self.simulator.has_breakpoint_hit()
+    }
+
+    /// Reset step counter and monitor results.
+    #[wasm_bindgen(js_name = resetMonitors)]
+    pub fn reset_monitors(&mut self) {
+        console_log!("[WASM] Resetting monitors");
+        self.simulator.reset_monitors();
+    }
+
+    // ========================================================================
+    // State Space Analysis
+    // ========================================================================
+
+    /// Calculate the state space (reachability graph).
+    /// Returns a JSON object with `report` and `graph` fields.
+    /// Options: maxStates (default 10000), maxArcs (default 50000), isTimed (default false)
+    /// Optional `distOverrides` is a JS object like { "exponential": 5.0, "normal": 10.0 }
+    /// Optional `intRangeOverrides` is a JS object like { "varName": 50 }
+    #[wasm_bindgen(js_name = calculateStateSpace)]
+    pub fn calculate_state_space(
+        &mut self,
+        max_states: Option<u32>,
+        max_arcs: Option<u32>,
+        is_timed: Option<bool>,
+        dist_overrides: JsValue,
+        int_range_overrides: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let max_s = max_states.unwrap_or(10_000);
+        let max_a = max_arcs.unwrap_or(50_000);
+        let timed = is_timed.unwrap_or(false);
+
+        // Parse optional deterministic overrides from JS objects
+        let dist_ov: Option<HashMap<String, f64>> = if dist_overrides.is_undefined() || dist_overrides.is_null() {
+            None
+        } else {
+            from_value(dist_overrides).ok()
+        };
+        let int_range_ov: Option<HashMap<String, i64>> = if int_range_overrides.is_undefined() || int_range_overrides.is_null() {
+            None
+        } else {
+            from_value(int_range_overrides).ok()
+        };
+
+        let has_overrides = dist_ov.is_some() || int_range_ov.is_some();
+        console_log!(
+            "[WASM] Calculating state space (maxStates={}, maxArcs={}, timed={}, deterministic={})",
+            max_s, max_a, timed, has_overrides
+        );
+        let result = self.simulator.calculate_state_space(max_s, max_a, timed, dist_ov, int_range_ov);
+        console_log!(
+            "[WASM] State space: {} states, {} arcs, {} SCCs (full={})",
+            result.report.num_states,
+            result.report.num_arcs,
+            result.report.num_scc,
+            result.report.is_full
+        );
+        to_value(&result).map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 }

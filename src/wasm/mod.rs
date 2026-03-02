@@ -266,6 +266,12 @@ impl WasmSimulator {
             result.report.num_scc,
             result.report.is_full
         );
-        to_value(&result).map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+        // Serialize via JSON to guarantee BTreeMap<String, …> becomes a plain
+        // JS object (serde_wasm_bindgen::to_value turns maps into JS Map
+        // instances which break Object.entries on the frontend).
+        let json_str = serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("JSON serialization error: {}", e)))?;
+        js_sys::JSON::parse(&json_str)
+            .map_err(|e| JsValue::from_str(&format!("JSON parse error: {:?}", e)))
     }
 }

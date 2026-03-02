@@ -18,7 +18,13 @@ thread_local! {
     /// Per-distribution-function override values for deterministic state space analysis.
     /// When a key exists, the corresponding distribution function returns the override value
     /// instead of sampling randomly.
+    /// Keys can be either a plain function name (e.g. "discrete") for global overrides,
+    /// or a context-qualified key (e.g. "discrete@t:Landing:time") for per-call-site overrides.
     static DIST_OVERRIDES: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
+    /// Current evaluation context — identifies which transition/arc field is being evaluated.
+    /// Set before each Rhai expression evaluation so distribution functions can look up
+    /// per-call-site overrides. Format: "t:<transition_name>:<field>" or "a:<arc_id>:<field>".
+    static EVAL_CONTEXT: RefCell<String> = RefCell::new(String::new());
 }
 
 // Represents a potential binding for a transition
@@ -989,13 +995,50 @@ fn register_calendar_module(engine: &mut Engine) {
 // See: https://cpntools.org/2018/01/18/random-distribution-functions/
 // ============================================================================
 
+/// Look up an override value for a distribution function.
+/// First checks for a context-specific key (e.g. "discrete@t:Landing:time"),
+/// then falls back to the global function-name key (e.g. "discrete").
+fn lookup_dist_override(fn_name: &str) -> Option<f64> {
+    DIST_OVERRIDES.with(|o| {
+        let overrides = o.borrow();
+        if overrides.is_empty() {
+            return None;
+        }
+        // Try context-specific key first
+        let ctx = EVAL_CONTEXT.with(|c| c.borrow().clone());
+        if !ctx.is_empty() {
+            let context_key = format!("{}@{}", fn_name, ctx);
+            if let Some(val) = overrides.get(&context_key).copied() {
+                return Some(val);
+            }
+        }
+        // Fall back to global function-name key
+        overrides.get(fn_name).copied()
+    })
+}
+
+/// Set the evaluation context before evaluating a Rhai expression.
+/// Format: "t:<transition_name>:<field>" or "a:<arc_id>:<field>".
+fn set_eval_context(ctx: &str) {
+    EVAL_CONTEXT.with(|c| {
+        *c.borrow_mut() = ctx.to_string();
+    });
+}
+
+/// Clear the evaluation context after expression evaluation.
+fn clear_eval_context() {
+    EVAL_CONTEXT.with(|c| {
+        c.borrow_mut().clear();
+    });
+}
+
 /// Bernoulli distribution: returns 1 with probability p, 0 with probability 1-p
 /// Raises exception if p < 0.0 or p > 1.0
 fn dist_bernoulli(p: f64) -> Result<i64, Box<EvalAltResult>> {
     if p < 0.0 || p > 1.0 {
         return Err(format!("Bernoulli: p must be in [0, 1], got {}", p).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("bernoulli").copied()) {
+    if let Some(val) = lookup_dist_override("bernoulli") {
         return Ok(val as i64);
     }
     let dist = Bernoulli::new(p).map_err(|e| format!("Bernoulli error: {}", e))?;
@@ -1009,7 +1052,7 @@ fn dist_beta(a: f64, b: f64) -> Result<f64, Box<EvalAltResult>> {
     if a <= 0.0 || b <= 0.0 {
         return Err(format!("Beta: a and b must be > 0, got a={}, b={}", a, b).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("beta").copied()) {
+    if let Some(val) = lookup_dist_override("beta") {
         return Ok(val);
     }
     let dist = Beta::new(a, b).map_err(|e| format!("Beta error: {}", e))?;
@@ -1026,7 +1069,7 @@ fn dist_binomial(n: i64, p: f64) -> Result<i64, Box<EvalAltResult>> {
     if p < 0.0 || p > 1.0 {
         return Err(format!("Binomial: p must be in [0, 1], got {}", p).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("binomial").copied()) {
+    if let Some(val) = lookup_dist_override("binomial") {
         return Ok(val as i64);
     }
     let dist = Binomial::new(n as u64, p).map_err(|e| format!("Binomial error: {}", e))?;
@@ -1040,7 +1083,7 @@ fn dist_chisq(n: i64) -> Result<f64, Box<EvalAltResult>> {
     if n < 1 {
         return Err(format!("Chisq: n must be >= 1, got {}", n).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("chisq").copied()) {
+    if let Some(val) = lookup_dist_override("chisq") {
         return Ok(val);
     }
     let dist = ChiSquared::new(n as f64).map_err(|e| format!("Chisq error: {}", e))?;
@@ -1054,7 +1097,7 @@ fn dist_discrete(a: i64, b: i64) -> Result<i64, Box<EvalAltResult>> {
     if a > b {
         return Err(format!("Discrete: a must be <= b, got a={}, b={}", a, b).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("discrete").copied()) {
+    if let Some(val) = lookup_dist_override("discrete") {
         return Ok(val as i64);
     }
     let mut rng = rand::rng();
@@ -1071,7 +1114,7 @@ fn dist_erlang(n: i64, r: f64) -> Result<f64, Box<EvalAltResult>> {
     if r <= 0.0 {
         return Err(format!("Erlang: r must be > 0, got {}", r).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("erlang").copied()) {
+    if let Some(val) = lookup_dist_override("erlang") {
         return Ok(val);
     }
     // Erlang(n, r) = Gamma(n, 1/r) where r is the rate
@@ -1086,7 +1129,7 @@ fn dist_exponential(r: f64) -> Result<f64, Box<EvalAltResult>> {
     if r <= 0.0 {
         return Err(format!("Exponential: r must be > 0, got {}", r).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("exponential").copied()) {
+    if let Some(val) = lookup_dist_override("exponential") {
         return Ok(val);
     }
     let dist = Exp::new(r).map_err(|e| format!("Exponential error: {}", e))?;
@@ -1100,7 +1143,7 @@ fn dist_gamma(l: f64, k: f64) -> Result<f64, Box<EvalAltResult>> {
     if l <= 0.0 || k <= 0.0 {
         return Err(format!("Gamma: l and k must be > 0, got l={}, k={}", l, k).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("gamma").copied()) {
+    if let Some(val) = lookup_dist_override("gamma") {
         return Ok(val);
     }
     // rand_distr::Gamma uses (shape, scale) = (k, l)
@@ -1115,7 +1158,7 @@ fn dist_normal(n: f64, v: f64) -> Result<f64, Box<EvalAltResult>> {
     if v < 0.0 {
         return Err(format!("Normal: variance must be >= 0, got {}", v).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("normal").copied()) {
+    if let Some(val) = lookup_dist_override("normal") {
         return Ok(val);
     }
     if v == 0.0 {
@@ -1134,7 +1177,7 @@ fn dist_poisson(m: f64) -> Result<i64, Box<EvalAltResult>> {
     if m <= 0.0 {
         return Err(format!("Poisson: m must be > 0, got {}", m).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("poisson").copied()) {
+    if let Some(val) = lookup_dist_override("poisson") {
         return Ok(val as i64);
     }
     let dist = Poisson::new(m).map_err(|e| format!("Poisson error: {}", e))?;
@@ -1151,7 +1194,7 @@ fn dist_rayleigh(s: f64) -> Result<f64, Box<EvalAltResult>> {
     if s == 0.0 {
         return Ok(0.0); // Zero scale means constant 0
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("rayleigh").copied()) {
+    if let Some(val) = lookup_dist_override("rayleigh") {
         return Ok(val);
     }
     // Rayleigh is a special case of Weibull with shape=2
@@ -1167,7 +1210,7 @@ fn dist_student(n: i64) -> Result<f64, Box<EvalAltResult>> {
     if n < 1 {
         return Err(format!("Student: n must be >= 1, got {}", n).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("student").copied()) {
+    if let Some(val) = lookup_dist_override("student") {
         return Ok(val);
     }
     let dist = StudentT::new(n as f64).map_err(|e| format!("Student error: {}", e))?;
@@ -1184,7 +1227,7 @@ fn dist_uniform(a: f64, b: f64) -> Result<f64, Box<EvalAltResult>> {
     if a == b {
         return Ok(a);
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("uniform").copied()) {
+    if let Some(val) = lookup_dist_override("uniform") {
         return Ok(val);
     }
     let dist = Uniform::new_inclusive(a, b).map_err(|e| format!("Uniform error: {}", e))?;
@@ -1198,7 +1241,7 @@ fn dist_weibull(lambda: f64, k: f64) -> Result<f64, Box<EvalAltResult>> {
     if lambda <= 0.0 || k <= 0.0 {
         return Err(format!("Weibull: lambda and k must be > 0, got lambda={}, k={}", lambda, k).into());
     }
-    if let Some(val) = DIST_OVERRIDES.with(|o| o.borrow().get("weibull").copied()) {
+    if let Some(val) = lookup_dist_override("weibull") {
         return Ok(val);
     }
     let dist = Weibull::new(lambda, k).map_err(|e| format!("Weibull error: {}", e))?;
@@ -1847,6 +1890,7 @@ impl Simulator {
         // Execute code segment if present (runs before output arc evaluation,
         // so variables set here are available in output arc inscriptions)
         if let Some(code_ast) = self.code_segment_asts.get(&selected_transition_id) {
+            set_eval_context(&format!("t:{}:codeSegment", transition_to_fire.name));
             match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, code_ast) {
                 Ok(_) => {
                     #[cfg(target_arch = "wasm32")]
@@ -1868,10 +1912,12 @@ impl Simulator {
                     }
                 }
             }
+            clear_eval_context();
         }
 
         // Evaluate transition time expression to get delay for produced tokens
         let time_delay: i64 = if let Some(time_ast) = self.time_expressions.get(&selected_transition_id) {
+            set_eval_context(&format!("t:{}:time", transition_to_fire.name));
             match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, time_ast) {
                 Ok(result) => {
                     let delay = result.as_int().unwrap_or(0);
@@ -1892,6 +1938,7 @@ impl Simulator {
         } else {
             0
         };
+        clear_eval_context();
 
         // Calculate the base timestamp for produced tokens (current_time + transition time_delay)
         let base_produced_token_time = self.current_time + time_delay;
@@ -1913,19 +1960,23 @@ impl Simulator {
 
                     // Evaluate per-arc delay expression if present
                     let arc_delay: i64 = if let Some(delay_ast) = self.arc_delay_expressions.get(&arc.id) {
-                        match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, delay_ast) {
+                        set_eval_context(&format!("a:{}:delay", arc.id));
+                        let result = match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, delay_ast) {
                             Ok(result) => result.as_int().unwrap_or(0),
                             Err(e) => {
                                 eprintln!("Error evaluating arc delay for arc {}: {}", arc.id, e);
                                 0
                             }
-                        }
+                        };
+                        clear_eval_context();
+                        result
                     } else {
                         0
                     };
                     let produced_token_time = base_produced_token_time + arc_delay;
 
                     if let Some(ast) = self.arc_expressions.get(&arc.id) {
+                        set_eval_context(&format!("a:{}:inscription", arc.id));
                         match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
                             Ok(produced_tokens_dynamic) => {
                                 // Check if the target place has a product colorset
@@ -1996,9 +2047,11 @@ impl Simulator {
                             }
                             Err(e) => {
                                 eprintln!("  Error evaluating output arc {} inscription: {}", arc.id, e);
+                                clear_eval_context();
                                 return None;
                             }
                         }
+                        clear_eval_context();
                     } else if !arc.inscription.is_empty() {
                         eprintln!("  Internal Error: Compiled AST not found for non-empty output arc {}", arc.id);
                         return None;
@@ -3000,6 +3053,7 @@ impl Simulator {
 
         // Execute code segment if present (runs before output arc evaluation)
         if let Some(code_ast) = self.code_segment_asts.get(transition_id) {
+            set_eval_context(&format!("t:{}:codeSegment", transition_to_fire.name));
             match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, code_ast) {
                 Ok(_) => {
                     #[cfg(target_arch = "wasm32")]
@@ -3021,10 +3075,12 @@ impl Simulator {
                     }
                 }
             }
+            clear_eval_context();
         }
 
         // Evaluate transition time expression to get delay for produced tokens
         let time_delay: i64 = if let Some(time_ast) = self.time_expressions.get(transition_id) {
+            set_eval_context(&format!("t:{}:time", transition_to_fire.name));
             match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, time_ast) {
                 Ok(result) => {
                     let delay = result.as_int().unwrap_or(0);
@@ -3045,6 +3101,7 @@ impl Simulator {
         } else {
             0
         };
+        clear_eval_context();
 
         // Calculate the base timestamp for produced tokens (current_time + transition time_delay)
         let base_produced_token_time = self.current_time + time_delay;
@@ -3066,19 +3123,23 @@ impl Simulator {
 
                 // Evaluate per-arc delay expression if present
                 let arc_delay: i64 = if let Some(delay_ast) = self.arc_delay_expressions.get(&arc.id) {
-                    match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, delay_ast) {
+                    set_eval_context(&format!("a:{}:delay", arc.id));
+                    let result = match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, delay_ast) {
                         Ok(result) => result.as_int().unwrap_or(0),
                         Err(e) => {
                             eprintln!("Error evaluating arc delay for arc {}: {}", arc.id, e);
                             0
                         }
-                    }
+                    };
+                    clear_eval_context();
+                    result
                 } else {
                     0
                 };
                 let produced_token_time = base_produced_token_time + arc_delay;
 
                 if let Some(ast) = self.arc_expressions.get(&arc.id) {
+                    set_eval_context(&format!("a:{}:inscription", arc.id));
                     match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
                         Ok(produced_tokens_dynamic) => {
                             let is_product_place = self.is_place_product_type(target_place_id);
@@ -3134,6 +3195,7 @@ impl Simulator {
                             eprintln!("Error evaluating output arc {}: {}", arc.id, e);
                         }
                     }
+                    clear_eval_context();
                 }
             }
         }
@@ -3690,6 +3752,7 @@ impl Simulator {
         // Clear deterministic overrides
         DIST_OVERRIDES.with(|o| o.borrow_mut().clear());
         self.int_range_overrides.clear();
+        clear_eval_context();
 
         #[cfg(target_arch = "wasm32")]
         let calc_time_ms: u64 = 0; // timing not available in WASM

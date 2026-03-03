@@ -133,6 +133,14 @@ impl WasmSimulator {
         }
     }
 
+    /// Get the current marking of all places.
+    /// Returns a JS object mapping place IDs to arrays of token values.
+    #[wasm_bindgen(js_name = getMarking)]
+    pub fn get_marking(&self) -> Result<JsValue, JsValue> {
+        let markings = self.simulator.get_all_markings();
+        to_value(markings).map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+    }
+
     /// Get the current simulation time in milliseconds
     #[wasm_bindgen(js_name = getCurrentTime)]
     pub fn get_current_time(&self) -> i64 {

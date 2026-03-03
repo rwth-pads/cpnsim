@@ -439,6 +439,11 @@ pub struct Simulator {
     /// When a key (variable name) exists, the override value is used instead of
     /// generating a random value within the colorset's range.
     int_range_overrides: HashMap<String, i64>,
+    /// Snapshot of the initial marking, saved at construction time.
+    /// Used to reset to initial state for state space exploration.
+    initial_marking_snapshot: HashMap<String, Vec<Dynamic>>,
+    /// Snapshot of the initial token timestamps, saved at construction time.
+    initial_timestamps_snapshot: HashMap<String, Vec<i64>>,
 }
 
 // ============================================================================
@@ -1706,6 +1711,10 @@ impl Simulator {
         SIM_CURRENT_TIME.with(|c| c.set(0));
         SIM_EPOCH_MS.with(|c| c.set(epoch_ms));
 
+        // Snapshot the initial marking before moving into the struct
+        let initial_marking_snapshot = current_marking.clone();
+        let initial_timestamps_snapshot = token_timestamps.clone();
+
         Ok(Simulator {
             model: model_data,
             current_marking,
@@ -1728,6 +1737,8 @@ impl Simulator {
             step_counter: 0,
             last_binding: HashMap::new(),
             int_range_overrides: HashMap::new(),
+            initial_marking_snapshot,
+            initial_timestamps_snapshot,
         })
     }
 
@@ -2954,6 +2965,8 @@ impl Simulator {
             step_counter: self.step_counter,
             last_binding: HashMap::new(),
             int_range_overrides: self.int_range_overrides.clone(),
+            initial_marking_snapshot: self.initial_marking_snapshot.clone(),
+            initial_timestamps_snapshot: self.initial_timestamps_snapshot.clone(),
         }
     }
 
@@ -3606,6 +3619,14 @@ impl Simulator {
         let original_marking = self.current_marking.clone();
         let original_timestamps = self.token_timestamps.clone();
         let original_time = self.current_time;
+
+        // Reset to initial marking so state space always starts from the model's
+        // initial state, not the current simulation state.
+        // Use the snapshot saved at construction time (avoids re-evaluating Rhai
+        // expressions with a potentially modified scope).
+        self.current_marking = self.initial_marking_snapshot.clone();
+        self.token_timestamps = self.initial_timestamps_snapshot.clone();
+        self.current_time = 0;
 
         // State tracking
         let mut visited: HashMap<CanonicalMarking, u32> = HashMap::new(); // canonical -> state_id

@@ -223,6 +223,54 @@ fn parse_simple_var_array_inscription(inscription: &str) -> (Option<String>, Opt
     }
 }
 
+/// Parses a list cons inscription like `[c] + l` (from SML `c::l`)
+/// or `[a, b] + l` (from SML `a::b::l`).
+/// Returns (head_var_names, tail_var_name) if valid.
+fn parse_list_cons_inscription(inscription: &str) -> Option<(Vec<String>, String)> {
+    let trimmed = inscription.trim();
+    // Must contain " + " separating [heads] and tail
+    let plus_idx = trimmed.find(" + ")?;
+    let head_part = trimmed[..plus_idx].trim();
+    let tail_part = trimmed[plus_idx + 3..].trim();
+
+    // Head part must be [var1, var2, ...]
+    if !head_part.starts_with('[') || !head_part.ends_with(']') {
+        return None;
+    }
+    let inner = head_part[1..head_part.len() - 1].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+    let mut head_vars = Vec::new();
+    for part in &parts {
+        if part.is_empty() {
+            return None;
+        }
+        // Must be a valid identifier
+        if !part.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_') {
+            return None;
+        }
+        if !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        head_vars.push(part.to_string());
+    }
+
+    // Tail part must be a valid identifier
+    if tail_part.is_empty() {
+        return None;
+    }
+    if !tail_part.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_') {
+        return None;
+    }
+    if !tail_part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    Some((head_vars, tail_part.to_string()))
+}
+
 /// Parses a product-style inscription like `[n, p]` into a list of variable names.
 /// Returns None if the inscription is not a valid product pattern.
 fn parse_product_inscription(inscription: &str) -> Option<Vec<String>> {
@@ -1361,24 +1409,27 @@ impl Simulator {
             let definition = cs.definition.trim();
             let mut parsed_cs = ParsedColorSet::unknown();
 
-            if definition.ends_with("= unit;") {
+            // Strip "timed" suffix for parsing purposes (timed is handled separately via cs.timed)
+            let def_for_parsing = definition.replace(" timed;", ";").replace(" timed ", " ");
+
+            if def_for_parsing.ends_with("= unit;") {
                 parsed_cs.kind = ColorSetKind::Unit;
-            } else if definition.ends_with("= bool;") {
+            } else if def_for_parsing.ends_with("= bool;") {
                 parsed_cs.kind = ColorSetKind::Bool;
-            } else if definition.ends_with("= int;") {
+            } else if def_for_parsing.ends_with("= int;") {
                 parsed_cs.kind = ColorSetKind::Int;
-            } else if definition.ends_with("= intinf;") {
+            } else if def_for_parsing.ends_with("= intinf;") {
                 parsed_cs.kind = ColorSetKind::IntInf;
-            } else if definition.ends_with("= time;") {
+            } else if def_for_parsing.ends_with("= time;") {
                 parsed_cs.kind = ColorSetKind::Time;
-            } else if definition.ends_with("= real;") {
+            } else if def_for_parsing.ends_with("= real;") {
                 parsed_cs.kind = ColorSetKind::Real;
-            } else if definition.ends_with("= string;") {
+            } else if def_for_parsing.ends_with("= string;") {
                 parsed_cs.kind = ColorSetKind::String;
-            } else if definition.contains("= int with") && definition.contains("..") && definition.ends_with(";") {
-                if let Some(range_part) = definition.split(" with ").nth(1) {
+            } else if def_for_parsing.contains("= int with") && def_for_parsing.contains("..") && def_for_parsing.ends_with(";") {
+                if let Some(range_part) = def_for_parsing.split(" with ").nth(1) {
                     if let Some(range_str) = range_part.split(';').next() {
-                        let bounds: Vec<&str> = range_str.split("..").collect();
+                        let bounds: Vec<&str> = range_str.trim().split("..").collect();
                         if bounds.len() == 2 {
                             if let (Ok(start), Ok(end)) = (bounds[0].trim().parse::<i64>(), bounds[1].trim().parse::<i64>()) {
                                 parsed_cs.kind = ColorSetKind::IntRange;
@@ -1392,8 +1443,8 @@ impl Simulator {
                         }
                     }
                 }
-            } else if definition.starts_with("colset ") && definition.contains("= list ") && definition.ends_with(";") {
-                if let Some(list_part) = definition.split("= list ").nth(1) {
+            } else if def_for_parsing.starts_with("colset ") && def_for_parsing.contains("= list ") && def_for_parsing.ends_with(";") {
+                if let Some(list_part) = def_for_parsing.split("= list ").nth(1) {
                     if let Some(element_type) = list_part.split(';').next() {
                         parsed_cs.kind = ColorSetKind::List;
                         parsed_cs.base_type_name = Some(element_type.trim().to_string());
@@ -1401,9 +1452,9 @@ impl Simulator {
                         eprintln!("Warning: Could not parse list element type in definition: {}", definition);
                     }
                 }
-            } else if definition.starts_with("colset ") && definition.contains("= product ") && definition.ends_with(";") {
+            } else if def_for_parsing.starts_with("colset ") && def_for_parsing.contains("= product ") && def_for_parsing.ends_with(";") {
                 // Parse product types like "colset INTxDATA = product INT * DATA;"
-                if let Some(product_part) = definition.split("= product ").nth(1) {
+                if let Some(product_part) = def_for_parsing.split("= product ").nth(1) {
                     if let Some(types_str) = product_part.split(';').next() {
                         let component_types: Vec<String> = types_str
                             .split('*')
@@ -1417,9 +1468,9 @@ impl Simulator {
                         }
                     }
                 }
-            } else if definition.starts_with("colset ") && definition.contains("= record ") && definition.ends_with(";") {
+            } else if def_for_parsing.starts_with("colset ") && def_for_parsing.contains("= record ") && def_for_parsing.ends_with(";") {
                 // Parse record types like "colset PERSON = record name: STRING * age: INT;"
-                if let Some(record_part) = definition.split("= record ").nth(1) {
+                if let Some(record_part) = def_for_parsing.split("= record ").nth(1) {
                     if let Some(fields_str) = record_part.split(';').next() {
                         let fields: Vec<(String, String)> = fields_str
                             .split('*')
@@ -1992,6 +2043,7 @@ impl Simulator {
                             Ok(produced_tokens_dynamic) => {
                                 // Check if the target place has a product colorset
                                 let is_product_place = self.is_place_product_type(place_id);
+                                let is_list_place = self.is_place_list_type(place_id);
                                 
                                 let tokens_to_add = if is_product_place {
                                     // For product places, check if the result is an array representing a single product token
@@ -2018,6 +2070,11 @@ impl Simulator {
                                     } else {
                                         vec![produced_tokens_dynamic]
                                     }
+                                } else if is_list_place {
+                                    // For list-typed places, the entire evaluated result
+                                    // (e.g. `l + [c]`) IS a single list token.  Do NOT
+                                    // unwrap the array into individual elements.
+                                    vec![produced_tokens_dynamic]
                                 } else {
                                     // For non-product places, use the original logic
                                     Self::dynamic_to_vec_dynamic(produced_tokens_dynamic)
@@ -2094,6 +2151,16 @@ impl Simulator {
             &consumed_pids,
             &produced_pids,
         );
+
+        // Eagerly advance simulation time after the step (CPN Tools behavior):
+        // If no transitions are currently enabled, advance to the earliest future token time.
+        // This ensures getCurrentTime() returns the "ready" time for the next step.
+        let post_step_bindings = self.find_enabled_bindings();
+        if post_step_bindings.is_empty() {
+            if let Some(earliest_future_time) = self.find_earliest_future_token_time() {
+                self.current_time = earliest_future_time;
+            }
+        }
 
         Some(event_data)
     }
@@ -2184,6 +2251,7 @@ impl Simulator {
                     a.target == transition.id || 
                     (a.is_bidirectional && a.source == transition.id)
                 }).collect();
+
 
                 for arc in &input_arcs {
                     // For bidirectional arcs where source is the transition, the place is the target
@@ -2284,58 +2352,84 @@ impl Simulator {
 
                         if !inscription.is_empty() && self.declared_variables.contains_key(inscription) {
                             let var_name = inscription;
-                            if self.is_list_variable(var_name) {
-                                /*
-                                [DEBUG] Deferring list variable '{}' for arc from place '{}' to transition '{}'
-                                */
-                                let mut new_binding = current_binding.clone();
-                                let deferred_info = DeferredArcInfo {
-                                    arc_id: arc.id.clone(),
-                                    place_id: place_id.clone(),
-                                    variable_name: var_name.clone(),
-                                };
-                                new_binding.deferred_list_arcs
-                                    .entry(var_name.clone())
-                                    .or_default()
-                                    .push(deferred_info);
-                                next_bindings_for_arc.push(new_binding);
-                            } else {
-                                /*
-                                [DEBUG] Attempting to bind variable '{}' from place '{}' for transition '{}'
-                                */
-                                if let Some(bound_value) = current_binding.variables.get(var_name) {
-                                    let bound_value_str = bound_value.to_string();
-                                    for token in &available_tokens_here {
-                                        // For timed tokens, compare the extracted value
-                                        let token_value = extract_token_value(token);
-                                        let token_value_str = token_value.to_string();
-                                        if token_value_str == bound_value_str {
-                                            let mut new_binding = current_binding.clone();
-                                            new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
-                                            next_bindings_for_arc.push(new_binding);
-                                            break;
-                                        }
+                            // Bind all variables (including list variables) to
+                            // available tokens from the input place.  Each token
+                            // in a list-typed place IS a list value, so normal
+                            // token-level binding is correct.
+                            if let Some(bound_value) = current_binding.variables.get(var_name) {
+                                let bound_value_str = bound_value.to_string();
+                                for token in &available_tokens_here {
+                                    // For timed tokens, compare the extracted value
+                                    let token_value = extract_token_value(token);
+                                    let token_value_str = token_value.to_string();
+                                    if token_value_str == bound_value_str {
+                                        let mut new_binding = current_binding.clone();
+                                        new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
+                                        next_bindings_for_arc.push(new_binding);
+                                        break;
                                     }
-                                } else {
-                                    let mut unique_tokens_processed = HashSet::new();
-                                    for token in &available_tokens_here {
-                                        // Extract the actual value from timed tokens for binding
-                                        let token_value = extract_token_value(token);
-                                        if unique_tokens_processed.insert(token_value.to_string()) {
-                                            /*
-                                            [DEBUG] Binding variable '{}' to token '{}' from place '{}' for transition '{}'
-                                            */
-                                            let mut new_binding = current_binding.clone();
-                                            // Bind the extracted value, not the whole timed token
-                                            new_binding.variables.insert(var_name.clone(), token_value);
-                                            new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
-                                            next_bindings_for_arc.push(new_binding);
-                                        }
+                                }
+                            } else {
+                                let mut unique_tokens_processed = HashSet::new();
+                                for token in &available_tokens_here {
+                                    // Extract the actual value from timed tokens for binding
+                                    let token_value = extract_token_value(token);
+                                    if unique_tokens_processed.insert(token_value.to_string()) {
+                                        let mut new_binding = current_binding.clone();
+                                        // Bind the extracted value, not the whole timed token
+                                        new_binding.variables.insert(var_name.clone(), token_value);
+                                        new_binding.consumed_tokens_map.entry(place_id.clone()).or_default().push(token.clone());
+                                        next_bindings_for_arc.push(new_binding);
                                     }
                                 }
                             }
-                        } else if inscription.is_empty() || inscription == "[]" {
+                        } else if inscription.is_empty() || (inscription == "[]" && !self.is_place_list_type(place_id)) {
+                            // For non-list places, "[]" means empty multiset → nothing to consume.
+                            // For list places, "[]" is a value (empty list) that must be matched
+                            // against tokens, so fall through to the expression-evaluation branch.
                             next_bindings_for_arc.push(current_binding.clone());
+                        } else if self.is_place_list_type(place_id) && parse_list_cons_inscription(inscription).is_some() {
+                            // ─── List cons decomposition: [c] + l  (from SML c::l) ───
+                            // Decompose list tokens into head element(s) + tail and bind variables.
+                            let (head_vars, tail_var) = parse_list_cons_inscription(inscription).unwrap();
+                            let n_heads = head_vars.len();
+                            for token in &available_tokens_here {
+                                let token_value = extract_token_value(token);
+                                if let Ok(arr) = token_value.clone().into_typed_array::<Dynamic>() {
+                                    if arr.len() < n_heads {
+                                        continue;
+                                    }
+                                    let mut new_binding = current_binding.clone();
+                                    let mut heads_ok = true;
+                                    for (i, hv) in head_vars.iter().enumerate() {
+                                        if let Some(existing_val) = current_binding.variables.get(hv) {
+                                            if existing_val.to_string() != arr[i].to_string() {
+                                                heads_ok = false;
+                                                break;
+                                            }
+                                        } else {
+                                            new_binding.variables.insert(hv.clone(), arr[i].clone());
+                                        }
+                                    }
+                                    if !heads_ok {
+                                        continue;
+                                    }
+                                    let tail_elements: Vec<Dynamic> = arr[n_heads..].to_vec();
+                                    let tail_value: Dynamic = tail_elements.into();
+                                    if let Some(existing_val) = current_binding.variables.get(&tail_var) {
+                                        if existing_val.to_string() != tail_value.to_string() {
+                                            continue;
+                                        }
+                                    } else {
+                                        new_binding.variables.insert(tail_var.clone(), tail_value);
+                                    }
+                                    new_binding.consumed_tokens_map
+                                        .entry(place_id.clone())
+                                        .or_default()
+                                        .push(token.clone());
+                                    next_bindings_for_arc.push(new_binding);
+                                }
+                            }
                         } else {
                             if let Some(inscription_ast) = self.arc_expressions.get(&arc.id) {
                                 let mut binding_scope = self.rhai_scope.clone();
@@ -2362,7 +2456,11 @@ impl Simulator {
                                             // product value against the extracted (un-timed) value
                                             // of each available token.
                                             let is_product = self.is_place_product_type(place_id);
-                                            if is_product {
+                                            let is_list = self.is_place_list_type(place_id);
+                                            if is_product || is_list {
+                                                // For product/list-typed places, the evaluated
+                                                // inscription is a SINGLE token.  Compare the
+                                                // whole value against available tokens.
                                                 let result_str = result_dynamic.to_string();
                                                 for token in &available_tokens_here {
                                                     let token_value = extract_token_value(token);
@@ -3156,6 +3254,7 @@ impl Simulator {
                     match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut firing_scope, ast) {
                         Ok(produced_tokens_dynamic) => {
                             let is_product_place = self.is_place_product_type(target_place_id);
+                            let is_list_place = self.is_place_list_type(target_place_id);
 
                             let tokens_to_add = if is_product_place {
                                 if let Ok(arr) = produced_tokens_dynamic.clone().into_typed_array::<Dynamic>() {
@@ -3173,6 +3272,10 @@ impl Simulator {
                                 } else {
                                     vec![produced_tokens_dynamic]
                                 }
+                            } else if is_list_place {
+                                // For list-typed places, the entire evaluated result
+                                // IS a single list token — do not unwrap.
+                                vec![produced_tokens_dynamic]
                             } else {
                                 Self::dynamic_to_vec_dynamic(produced_tokens_dynamic)
                             };
@@ -3276,6 +3379,18 @@ impl Simulator {
         if let Some(net) = self.model.petri_nets.first() {
             if let Some(place) = net.places.iter().find(|p| p.id == place_id) {
                 return self.is_product_colorset(&place.color_set);
+            }
+        }
+        false
+    }
+
+    /// Returns `true` when the colour-set of the given place is a `List` type.
+    fn is_place_list_type(&self, place_id: &str) -> bool {
+        if let Some(net) = self.model.petri_nets.first() {
+            if let Some(place) = net.places.iter().find(|p| p.id == place_id) {
+                if let Some(cs) = self.parsed_color_sets.get(&place.color_set) {
+                    return cs.kind == ColorSetKind::List;
+                }
             }
         }
         false

@@ -2043,6 +2043,17 @@ impl Simulator {
                                         already_bound_random.insert(var_name.clone());
                                     }
                                 }
+                            } else if parsed_cs.kind == ColorSetKind::Unit {
+                                // Unit variable: only possible value is ()
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    web_sys::console::log_1(&format!(
+                                        "[WASM] Binding unit variable {} to () (from colorset {})",
+                                        var_name, colorset_name
+                                    ).into());
+                                }
+                                firing_scope.push_constant(var_name, Dynamic::UNIT);
+                                already_bound_random.insert(var_name.clone());
                             }
                         }
                     }

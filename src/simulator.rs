@@ -271,6 +271,31 @@ fn parse_list_cons_inscription(inscription: &str) -> Option<(Vec<String>, String
     Some((head_vars, tail_part.to_string()))
 }
 
+/// Normalizes standalone `=` to `==` in guard expressions.
+/// In CPN guard syntax (SML-derived), `=` means equality comparison,
+/// but Rhai uses `=` for assignment and `==` for comparison.
+/// This converts `its=oi(or)` → `its==oi(or)` while preserving
+/// `==`, `!=`, `<=`, `>=`, and `=>`.
+fn normalize_guard_equals(guard: &str) -> String {
+    let chars: Vec<char> = guard.chars().collect();
+    let mut result = String::with_capacity(guard.len() + 10);
+    let len = chars.len();
+    for i in 0..len {
+        if chars[i] == '=' {
+            let preceded_by_op = i > 0 && matches!(chars[i - 1], '!' | '<' | '>' | '=');
+            let followed_by_eq_or_gt = i + 1 < len && matches!(chars[i + 1], '=' | '>');
+            if !preceded_by_op && !followed_by_eq_or_gt {
+                result.push_str("==");
+            } else {
+                result.push('=');
+            }
+        } else {
+            result.push(chars[i]);
+        }
+    }
+    result
+}
+
 /// Parses a product-style inscription like `[n, p]` into a list of variable names.
 /// Returns None if the inscription is not a valid product pattern.
 fn parse_product_inscription(inscription: &str) -> Option<Vec<String>> {
@@ -1642,7 +1667,18 @@ impl Simulator {
             }
             for transition in &net.transitions {
                 if !transition.guard.is_empty() && transition.guard.to_lowercase() != "true" {
-                    match engine.compile(&transition.guard) {
+                    // Normalize SML-style `=` (equality) to Rhai `==` (comparison)
+                    let normalized_guard = normalize_guard_equals(&transition.guard);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if normalized_guard != transition.guard {
+                            web_sys::console::log_1(&format!(
+                                "[WASM] Guard normalized: '{}' → '{}'",
+                                transition.guard, normalized_guard
+                            ).into());
+                        }
+                    }
+                    match engine.compile(&normalized_guard) {
                         Ok(ast) => {
                             guards.insert(transition.id.clone(), ast);
                         }
@@ -2400,11 +2436,29 @@ impl Simulator {
 
                         if !inscription.is_empty() && self.declared_variables.contains_key(inscription) {
                             let var_name = inscription;
-                            // Bind all variables (including list variables) to
-                            // available tokens from the input place.  Each token
-                            // in a list-typed place IS a list value, so normal
-                            // token-level binding is correct.
-                            if let Some(bound_value) = current_binding.variables.get(var_name) {
+
+                            // Check if this is a list-typed variable on a non-list place.
+                            // In that case, defer the binding to the guard evaluation phase,
+                            // which will compute the required multiset via the guard expression
+                            // (e.g., guard `its=oi(or)` computes the list and then consumes
+                            // matching tokens from the input place).
+                            let is_list_var_on_nonlist_place = self.is_list_variable(var_name)
+                                && !self.is_place_list_type(place_id);
+
+                            if is_list_var_on_nonlist_place {
+                                // Defer: don't bind now; let the guard resolve this
+                                let mut new_binding = current_binding.clone();
+                                let deferred_info = DeferredArcInfo {
+                                    arc_id: arc.id.clone(),
+                                    place_id: place_id.clone(),
+                                    variable_name: var_name.clone(),
+                                };
+                                new_binding.deferred_list_arcs
+                                    .entry(var_name.clone())
+                                    .or_default()
+                                    .push(deferred_info);
+                                next_bindings_for_arc.push(new_binding);
+                            } else if let Some(bound_value) = current_binding.variables.get(var_name) {
                                 let bound_value_str = bound_value.to_string();
                                 for token in &available_tokens_here {
                                     // For timed tokens, compare the extracted value

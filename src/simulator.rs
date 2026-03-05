@@ -333,6 +333,7 @@ enum ColorSetKind {
     List,
     Product,
     Record,
+    Enum,
     Unknown,
 }
 
@@ -345,6 +346,8 @@ struct ParsedColorSet {
     component_types: Option<Vec<String>>,
     /// For record types, the list of (field_name, field_type) pairs
     record_fields: Option<Vec<(String, String)>>,
+    /// For enum types, the list of enum value identifiers
+    enum_values: Option<Vec<String>>,
 }
 
 impl ParsedColorSet {
@@ -355,6 +358,7 @@ impl ParsedColorSet {
             range: None,
             record_fields: None,
             component_types: None,
+            enum_values: None,
         }
     }
 }
@@ -1492,6 +1496,23 @@ impl Simulator {
                         }
                     }
                 }
+            } else if def_for_parsing.starts_with("colset ") && def_for_parsing.contains("= with ") && def_for_parsing.ends_with(";") {
+                // Parse enum types like "colset Beer = with Corona|Heineken|Miller|Tuborg;"
+                if let Some(with_part) = def_for_parsing.split("= with ").nth(1) {
+                    if let Some(values_str) = with_part.split(';').next() {
+                        let enum_values: Vec<String> = values_str
+                            .split('|')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !enum_values.is_empty() {
+                            parsed_cs.kind = ColorSetKind::Enum;
+                            parsed_cs.enum_values = Some(enum_values);
+                        } else {
+                            eprintln!("Warning: Could not parse enum values in definition: {}", definition);
+                        }
+                    }
+                }
             } else {
                 eprintln!("Warning: Unrecognized colorset definition format for '{}': {}", name, definition);
             }
@@ -1506,6 +1527,17 @@ impl Simulator {
         }
 
         let mut all_fn_code = String::new();
+
+        // Register enum values as string constants in the Rhai scope
+        // (e.g., colset Beer = with Corona|Heineken|Miller|Tuborg; → Corona="Corona", etc.)
+        for (_, parsed_cs) in &parsed_color_sets {
+            if let Some(enum_values) = &parsed_cs.enum_values {
+                for val in enum_values {
+                    scope.push_constant(val.as_str(), val.clone());
+                }
+            }
+        }
+
         for func in &model_data.functions {
             all_fn_code.push_str(&func.code);
             all_fn_code.push('\n');
@@ -1941,6 +1973,22 @@ impl Simulator {
                                     }
                                     firing_scope.push_constant(var_name, Dynamic::from(value));
                                     already_bound_random.insert(var_name.clone());
+                                }
+                            } else if parsed_cs.kind == ColorSetKind::Enum {
+                                // Enum variable: pick a random enum value
+                                if let Some(enum_values) = &parsed_cs.enum_values {
+                                    if !enum_values.is_empty() {
+                                        let chosen = enum_values.choose(&mut rng).unwrap().clone();
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            web_sys::console::log_1(&format!(
+                                                "[WASM] Binding random enum variable {} to {} (from colorset {})",
+                                                var_name, chosen, colorset_name
+                                            ).into());
+                                        }
+                                        firing_scope.push_constant(var_name, Dynamic::from(chosen));
+                                        already_bound_random.insert(var_name.clone());
+                                    }
                                 }
                             }
                         }
@@ -2886,6 +2934,9 @@ impl Simulator {
                     let prio_name = t.priority.trim();
                     if prio_name.is_empty() || prio_name == "NONE" {
                         None
+                    } else if let Ok(n) = prio_name.parse::<i64>() {
+                        // Numeric priority used directly
+                        Some(n)
                     } else {
                         self.model.get_priority_level(prio_name)
                     }
@@ -3154,6 +3205,14 @@ impl Simulator {
                                     };
                                     firing_scope.push_constant(var_name, Dynamic::from(value));
                                     already_bound_random.insert(var_name.clone());
+                                }
+                            } else if parsed_cs.kind == ColorSetKind::Enum {
+                                if let Some(enum_values) = &parsed_cs.enum_values {
+                                    if !enum_values.is_empty() {
+                                        let chosen = enum_values.choose(&mut rng).unwrap().clone();
+                                        firing_scope.push_constant(var_name, Dynamic::from(chosen));
+                                        already_bound_random.insert(var_name.clone());
+                                    }
                                 }
                             }
                         }

@@ -1,6 +1,6 @@
 [package]
 name = "cpnsim"
-version = "0.4.6"
+version = "0.4.7"
 authors = ["István Koren"]
 edition = "2024"
 license = "MIT"

@@ -280,17 +280,34 @@ fn normalize_guard_equals(guard: &str) -> String {
     let chars: Vec<char> = guard.chars().collect();
     let mut result = String::with_capacity(guard.len() + 10);
     let len = chars.len();
+    // Track whether we just saw `let <identifier>` so we skip the assignment `=`
+    let mut skip_next_eq = false;
     for i in 0..len {
         if chars[i] == '=' {
             let preceded_by_op = i > 0 && matches!(chars[i - 1], '!' | '<' | '>' | '=');
             let followed_by_eq_or_gt = i + 1 < len && matches!(chars[i + 1], '=' | '>');
-            if !preceded_by_op && !followed_by_eq_or_gt {
-                result.push_str("==");
-            } else {
+            if skip_next_eq || preceded_by_op || followed_by_eq_or_gt {
                 result.push('=');
+                skip_next_eq = false;
+            } else {
+                result.push_str("==");
             }
         } else {
             result.push(chars[i]);
+            // Detect `let <identifier>` pattern: the next `=` is an assignment
+            if !chars[i].is_whitespace() {
+                // Check if current position ends a `let <ident>` sequence
+                // Look back to see if this non-whitespace char is preceded by `let `
+                let so_far = &result;
+                let trimmed_end = so_far.trim_end();
+                // Find last whitespace-separated token and check if preceded by "let "
+                if let Some(space_pos) = trimmed_end.rfind(|c: char| c.is_whitespace()) {
+                    let before_space = trimmed_end[..space_pos].trim_end();
+                    if before_space.ends_with("let") {
+                        skip_next_eq = true;
+                    }
+                }
+            }
         }
     }
     result

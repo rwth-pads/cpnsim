@@ -2116,6 +2116,7 @@ impl Simulator {
 
         // Calculate the base timestamp for produced tokens (current_time + transition time_delay)
         let base_produced_token_time = self.current_time + time_delay;
+        let mut transition_completion_time = self.current_time;
 
         if let Some(net) = self.model.petri_nets.first() {
             for arc in &net.arcs {
@@ -2148,6 +2149,7 @@ impl Simulator {
                         0
                     };
                     let produced_token_time = base_produced_token_time + arc_delay;
+                    transition_completion_time = transition_completion_time.max(produced_token_time);
 
                     if let Some(ast) = self.arc_expressions.get(&arc.id) {
                         set_eval_context(&format!("a:{}:inscription", arc.id));
@@ -2262,6 +2264,7 @@ impl Simulator {
             &event_data.transition_name,
             &consumed_pids,
             &produced_pids,
+            transition_completion_time,
         );
 
         // Eagerly advance simulation time after the step (CPN Tools behavior):
@@ -3586,6 +3589,18 @@ impl Simulator {
 
     /// Register a monitor from its JSON config. Compiles Rhai scripts.
     pub fn add_monitor(&mut self, config: MonitorConfig) -> Result<(), String> {
+        if config.monitor_type == MonitorType::IntervalDuration {
+            if config.start_transition_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(format!("Monitor '{}' is missing a start transition", config.name));
+            }
+            if config.end_transition_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(format!("Monitor '{}' is missing an end transition", config.name));
+            }
+            if config.correlation_key.trim().is_empty() {
+                return Err(format!("Monitor '{}' is missing a correlation key", config.name));
+            }
+        }
+
         let observation_ast = if !config.observation_script.is_empty() {
             Some(
                 self.rhai_engine
@@ -3606,8 +3621,18 @@ impl Simulator {
             None
         };
 
+        let correlation_key_ast = if !config.correlation_key.trim().is_empty() {
+            Some(
+                self.rhai_engine
+                    .compile(&config.correlation_key)
+                    .map_err(|e| format!("Monitor '{}' correlation key error: {}", config.name, e))?,
+            )
+        } else {
+            None
+        };
+
         self.monitors
-            .push(CompiledMonitor::new(config, observation_ast, predicate_ast));
+            .push(CompiledMonitor::new(config, observation_ast, predicate_ast, correlation_key_ast));
         Ok(())
     }
 
@@ -3625,6 +3650,7 @@ impl Simulator {
                 monitor.config.monitor_type.clone(),
             );
             monitor.step_count = 0;
+            monitor.active_intervals.clear();
         }
     }
 
@@ -3648,6 +3674,7 @@ impl Simulator {
         transition_name: &str,
         consumed_place_ids: &[String],
         produced_place_ids: &[String],
+        transition_completion_time: i64,
     ) {
         // Build place token counts from current marking
         let place_token_counts: HashMap<String, i64> = self
@@ -3799,6 +3826,45 @@ impl Simulator {
                                     let _ = e;
                                 }
                             }
+                        }
+                    }
+                }
+
+                MonitorType::IntervalDuration => {
+                    let start_transition_id = monitor.config.start_transition_id.as_deref();
+                    let end_transition_id = monitor.config.end_transition_id.as_deref();
+                    if Some(transition_id) != start_transition_id && Some(transition_id) != end_transition_id {
+                        continue;
+                    }
+
+                    let Some(ref correlation_key_ast) = monitor.correlation_key_ast else {
+                        continue;
+                    };
+
+                    let mut scope = base_scope.clone();
+                    let key = match self.rhai_engine.eval_ast_with_scope::<Dynamic>(&mut scope, correlation_key_ast) {
+                        Ok(val) => val.to_string(),
+                        Err(e) => {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "[WASM] Monitor '{}' correlation key error: {}",
+                                        monitor.config.name, e
+                                    )
+                                    .into(),
+                                );
+                            }
+                            let _ = e;
+                            continue;
+                        }
+                    };
+
+                    if Some(transition_id) == start_transition_id {
+                        monitor.active_intervals.insert(key, transition_completion_time);
+                    } else if Some(transition_id) == end_transition_id {
+                        if let Some(start_time) = monitor.active_intervals.remove(&key) {
+                            monitor.result.record(step, transition_completion_time, (transition_completion_time - start_time) as f64);
                         }
                     }
                 }

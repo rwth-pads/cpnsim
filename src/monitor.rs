@@ -16,6 +16,8 @@ pub enum MonitorType {
     BreakpointTransition,
     /// User-defined data collector with Rhai observation function
     DataCollector,
+    /// Measure duration between paired start/end transition firings
+    IntervalDuration,
 }
 
 /// Configuration passed from the frontend to register a monitor.
@@ -46,6 +48,15 @@ pub struct MonitorConfig {
     /// For built-in breakpoints: "empty", "not-empty", "enabled", "not-enabled"
     #[serde(default)]
     pub stop_condition: Option<String>,
+    /// Start transition for interval duration monitors
+    #[serde(default)]
+    pub start_transition_id: Option<String>,
+    /// End transition for interval duration monitors
+    #[serde(default)]
+    pub end_transition_id: Option<String>,
+    /// Rhai expression evaluated against binding variables to correlate start/end events
+    #[serde(default)]
+    pub correlation_key: String,
 }
 
 /// A single data point recorded by a monitor.
@@ -151,19 +162,28 @@ pub struct CompiledMonitor {
     pub config: MonitorConfig,
     pub observation_ast: Option<AST>,
     pub predicate_ast: Option<AST>,
+    pub correlation_key_ast: Option<AST>,
     pub result: MonitorResult,
     pub step_count: u64, // for transition-count: how many times the transition fired
+    pub active_intervals: HashMap<String, i64>,
 }
 
 impl CompiledMonitor {
-    pub fn new(config: MonitorConfig, observation_ast: Option<AST>, predicate_ast: Option<AST>) -> Self {
+    pub fn new(
+        config: MonitorConfig,
+        observation_ast: Option<AST>,
+        predicate_ast: Option<AST>,
+        correlation_key_ast: Option<AST>,
+    ) -> Self {
         let result = MonitorResult::new(&config.id, &config.name, config.monitor_type.clone());
         CompiledMonitor {
             config,
             observation_ast,
             predicate_ast,
+            correlation_key_ast,
             result,
             step_count: 0,
+            active_intervals: HashMap::new(),
         }
     }
 }
